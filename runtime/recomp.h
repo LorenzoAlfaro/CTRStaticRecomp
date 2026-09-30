@@ -198,6 +198,12 @@ void rt_invalid(CPU* c, uint32_t pc);
 void rt_fallthrough(CPU* c, uint32_t pc);
 void rt_warn_delay(CPU* c, uint32_t pc);
 
+// Enhancement hooks (runtime/hooks.cpp): the recompiler emits a call before each
+// instruction listed in gen/recomp.py HOOKS; the interpreter checks rt_is_hook().
+extern int g_hooks_on;
+void rt_hook(CPU* c, uint32_t pc);
+int rt_is_hook(uint32_t pc);
+
 uint32_t rt_mfc0(CPU* c, int reg);
 void rt_mtc0(CPU* c, int reg, uint32_t v);
 void rt_rfe(CPU* c);

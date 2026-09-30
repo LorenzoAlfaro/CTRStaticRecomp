@@ -186,6 +186,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
             if (depth == 0) return;
             depth--;
         }
+        if (g_hooks_on && rt_is_hook(canon(pc))) rt_hook(c, canon(pc));
         uint32_t w = MEM_LW(pc);
         uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31, rd = (w >> 11) & 31;
         uint32_t simm = (uint32_t)(int32_t)(int16_t)(w & 0xFFFF);

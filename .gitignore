@@ -8,3 +8,4 @@ ctr.log
 run_err.txt
 run_out.txt
 __pycache__/
+ctr.cfg

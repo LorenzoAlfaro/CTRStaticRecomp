@@ -114,6 +114,25 @@ static void convert_display() {
     }
 }
 
+// persistent user settings (ctr.cfg next to the game)
+static void load_settings() {
+    FILE* f = fopen("ctr.cfg", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        int v;
+        if (sscanf(line, "widescreen=%d", &v) == 1) set_widescreen(v != 0);
+    }
+    fclose(f);
+}
+
+static void save_settings() {
+    FILE* f = fopen("ctr.cfg", "w");
+    if (!f) return;
+    fprintf(f, "widescreen=%d\n", widescreen() ? 1 : 0);
+    fclose(f);
+}
+
 static void update_pad() {
     const uint8_t* k = SDL_GetKeyboardState(nullptr);
     uint16_t b = 0xFFFF;
@@ -224,6 +243,10 @@ void frontend_poll_input() {
                 bool fs = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
                 SDL_SetWindowFullscreen(window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F9) {
+                set_widescreen(!widescreen());
+                save_settings();
+            }
             if (e.key.keysym.scancode == SDL_SCANCODE_TAB) fast_forward = true;
             if (e.key.keysym.scancode == SDL_SCANCODE_PAUSE) paused = !paused;
             break;
@@ -244,9 +267,11 @@ void frontend_vblank() {
     SDL_UpdateTexture(texture, &src, frame.data(), d.w * 4);
     int ww, wh;
     SDL_GetRendererOutputSize(renderer, &ww, &wh);
-    // 4:3 letterbox
-    int dw = ww, dh = ww * 3 / 4;
-    if (dh > wh) { dh = wh; dw = wh * 4 / 3; }
+    // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a 16:9
+    // field of view into the same buffer, shown stretched to 16:9
+    int ax = widescreen() ? 16 : 4, ay = widescreen() ? 9 : 3;
+    int dw = ww, dh = ww * ay / ax;
+    if (dh > wh) { dh = wh; dw = wh * ax / ay; }
     SDL_Rect dst = {(ww - dw) / 2, (wh - dh) / 2, dw, dh};
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -288,7 +313,8 @@ void frontend_vblank() {
     if (fps_t == 0) fps_t = t;
     if (t - fps_t >= 1.0) {
         char title[128];
-        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps", (frame_counter - fps_n) / (t - fps_t));
+        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps%s", (frame_counter - fps_n) / (t - fps_t),
+                 widescreen() ? " - 16:9" : "");
         SDL_SetWindowTitle(window, title);
         fps_t = t;
         fps_n = frame_counter;
@@ -334,8 +360,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s <CTR (USA).cue|.bin>\n  (or put the path in ctr_disc.txt)\n", argv[0]);
         return 1;
     }
+    load_settings();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
+        else if (!strcmp(argv[i], "--widescreen")) set_widescreen(true);
+        else if (!strcmp(argv[i], "--no-widescreen")) set_widescreen(false);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
             shot_frame = strtoull(argv[++i], nullptr, 10);

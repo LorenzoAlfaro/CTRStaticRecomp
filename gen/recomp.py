@@ -35,6 +35,9 @@ UNWIND_RESUME_FASTRET = 0x80071694
 # Hand-written assembly with custom calling conventions (register continuations, flattened
 # loops that return several levels at once, ra/sp used as data). These run on the
 # interpreter, which follows MIPS control flow exactly; everything else is recompiled.
+# Enhancement hooks: rt_hook(c, addr) runs before these instructions when g_hooks_on is set
+# (runtime/hooks.cpp; widescreen patches in PushBuffer_SetMatrixVP / PushBuffer_UpdateFrustum).
+HOOKS = {0x80042E34, 0x80043170, 0x80043280}
 INTERP_ONLY_MAIN = [(0x80069BB0, 0x800715E8)]  # DrawSky .. RenderBucket_* .. TRIG_* (render asm)
 INTERP_ONLY_OVERLAYS = {226, 227, 228, 229}      # per-player-count level renderers
 if os.environ.get("RECOMP_NO_INTERP_ONLY") == "1":  # debugging: recompile the asm too
@@ -729,6 +732,8 @@ class Emitter:
                 fn.labels.add(a + 4)
                 prev = a
                 continue
+            if a in HOOKS and self.mod.name == "main":
+                self.line(f"if (g_hooks_on) rt_hook(c, {a:#x}u);")
             self.pending += cycles(i) if i.valid else 1
             if PRECISE:
                 self.flush_cycles()

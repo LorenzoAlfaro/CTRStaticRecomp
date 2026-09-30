@@ -54,13 +54,23 @@ The disc path is remembered in `ctr_disc.txt`. The log is written to `ctr.log`.
 
 Keyboard: arrows = D-pad, C = Cross, V = Circle, X = Square, Z = Triangle, Enter = Start,
 Space = Select, LShift/RShift = L1/R1, LCtrl/RCtrl = L2/R2. F11 or Alt+Enter = fullscreen,
-Tab = fast forward, Pause = pause.
+Tab = fast forward, Pause = pause, F9 = toggle 16:9 widescreen (saved in `ctr.cfg`).
 
 Game controllers with an SDL mapping (Xbox/XInput, DualShock 4/DualSense, most common pads)
 use the standard layout (A = Cross, B = Circle, X = Square, Y = Triangle). Joysticks without a
 mapping (e.g. vJoy) use a generic layout: button 0 = Cross, 1 = Circle, 2 = Square,
 3 = Triangle, 4/5 = L1/R1, 6/7 = L2/R2, 8 = Select, 9 = Start, stick/hat = D-pad.
 Detected devices are listed in `ctr.log`.
+
+## Widescreen
+
+`--widescreen` or F9 switches to 16:9. It works like the CTR-ModSDK 16BY9 mod: the X row of the
+camera's view-projection matrix is scaled by 3/4 so a wider field of view fits in the game's
+512x216 buffer, which is then shown stretched to 16:9. The culling frustum and far-clip
+distance are widened to match, so nothing pops in at the new edges. These patches are runtime
+hooks on three instructions in `PushBuffer_SetMatrixVP` / `PushBuffer_UpdateFrustum`
+(`runtime/hooks.cpp`, `HOOKS` in `gen/recomp.py`). 2D elements (HUD, menus, text) are not
+corrected and appear 33% wider.
 
 ## Debugging tools
 

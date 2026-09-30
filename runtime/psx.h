@@ -84,6 +84,10 @@ struct DisplayInfo {
 DisplayInfo gpu_display();
 const uint16_t* gpu_vram();
 
+// ---- enhancements (hooks.cpp) -------------------------------------------------------
+void set_widescreen(bool on);
+bool widescreen();
+
 // ---- SPU ---------------------------------------------------------------------------
 void spu_init();
 uint16_t spu_read16(uint32_t off);
