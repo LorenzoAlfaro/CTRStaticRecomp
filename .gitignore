@@ -1,0 +1,10 @@
+build/
+data/
+ctr.exe
+ctr_disc.txt
+*.mcd
+ctr.log
+*.log
+run_err.txt
+run_out.txt
+__pycache__/
