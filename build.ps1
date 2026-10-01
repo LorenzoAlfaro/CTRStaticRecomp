@@ -3,7 +3,7 @@
 param(
     [string]$Disc,
     [ValidateSet("Release", "Debug")][string]$Config = "Release",
-    [string]$Syms = "$PSScriptRoot\..\CTRRecomp\symbols\syms926.txt"
+    [string]$Syms = "data/syms926.txt"
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -23,6 +23,18 @@ if ($Disc) {
 }
 if (-not (Test-Path data/SCUS_944.26)) { throw "run with -Disc first" }
 
+# Function names / extra discovery seeds from the CTR-ModSDK decompilation project (GPL-3.0),
+# downloaded from a pinned commit rather than redistributed here. Optional: without it the
+# recompiler still finds functions from the code itself, with less readable output.
+$SymsUrl = "https://raw.githubusercontent.com/CTR-tools/CTR-ModSDK/e3f19686fb07d62847836ae77c733573a54d3534/symbols/syms926.txt"
+if (-not (Test-Path $Syms) -and $Syms -eq "data/syms926.txt") {
+    try {
+        Invoke-WebRequest $SymsUrl -OutFile $Syms -UseBasicParsing
+        Write-Host "Downloaded CTR-ModSDK symbol map to $Syms"
+    } catch {
+        Write-Warning "could not download the CTR-ModSDK symbol map ($($_.Exception.Message)); building without it"
+    }
+}
 $symArg = @()
 if (Test-Path $Syms) { $symArg = @("--syms", $Syms) }
 python gen/recomp.py --data data --out build/gen @symArg

@@ -13,7 +13,7 @@ $env:PATH = "$($llvm.FullName)\bin;$($ninja.FullName);C:\Program Files\CMake\bin
 
 if (-not $NoBuild) {
     $env:RECOMP_PRECISE = "1"
-    python gen/recomp.py --data data --out build/gen_precise --syms ..\CTRRecomp\symbols\syms926.txt | Out-Null
+    python gen/recomp.py --data data --out build/gen_precise --syms data/syms926.txt | Out-Null
     Remove-Item Env:\RECOMP_PRECISE
     if ($LASTEXITCODE) { throw "recompiler failed" }
     $chk = if ($Checks) { "-DRECOMP_CHECK_CALLS=ON" } else { "-DRECOMP_CHECK_CALLS=OFF" }

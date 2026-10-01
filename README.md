@@ -1,9 +1,30 @@
 # CTR Static Recomp
 
-A static recompilation of **Crash Team Racing (USA, SCUS-94426)** for Windows. The game's
-MIPS R3000A code is translated to C at build time and linked with a runtime that emulates
-the PS1 hardware underneath it. No game data or code is included: everything is read from
-your own disc image when you build and run.
+A static recompilation of **Crash Team Racing** (PlayStation, USA, SCUS-94426) for Windows.
+The game's original MIPS R3000A machine code is translated to C at build time and linked with
+a runtime that emulates the PS1 hardware underneath it, so the game runs as a native program
+rather than in an emulator.
+
+**No game code or data is included.** You need your own disc image: the build extracts the
+code from it, and the game reads its data from it at run time.
+
+This is not a decompilation and does not use decompiled source. The game logic comes from the
+original binary (see *Credits* for what the CTR-ModSDK decomp project contributed).
+[`docs/RECOMP_LESSONS.md`](docs/RECOMP_LESSONS.md) records the problems hit while building it,
+for anyone writing a recompiler.
+
+## Status
+
+* Boots through the intros, title and menus and plays races at full speed with music, sound
+  effects and XA audio. Tested so far: the menus, single races in arcade mode, and entering
+  adventure mode. Other modes, multiplayer and memory card saves (`memcard1.mcd`) have not
+  been tested yet.
+* 4x internal resolution with sub-pixel vertices (no wobble) by default, optional 16:9
+  widescreen, keyboard and controller support (see below).
+* Not implemented: FMV playback (MDEC), the demo disc (`LoadExec`), the analog-pad protocol
+  (analog sticks are mapped to the D-pad), more than one controller port.
+* Windows x64 only for now (`runtime/jmp.c` is Win64 assembly; everything else is portable
+  C/C++ with SDL2).
 
 ## Layout
 
@@ -19,8 +40,8 @@ your own disc image when you build and run.
 
 ## How it works
 
-* **Recompiled code.** Every function reachable from the entry point, the symbol list
-  (`CTR-ModSDK/symbols/syms926.txt`), `jal` targets, and code pointers found in data becomes a
+* **Recompiled code.** Every function reachable from the entry point, the symbol map
+  (CTR-ModSDK `symbols/syms926.txt`), `jal` targets, and code pointers found in data becomes a
   C function operating on a `CPU` struct. Jump tables become `switch` statements; indirect
   calls go through `rt_call`, which looks the target up at runtime.
 * **Overlays.** Overlays share load addresses (three regions). Calls into an overlay region
@@ -48,7 +69,10 @@ Ninja-build.Ninja MartinStorsjo.LLVM-MinGW.UCRT`). SDL2 is downloaded by CMake.
 .\ctr.exe
 ```
 
-The disc path is remembered in `ctr_disc.txt`. The log is written to `ctr.log`.
+Run `build.ps1` from PowerShell 7 (`pwsh`). The disc path is remembered in `ctr_disc.txt`; the
+log is written to `ctr.log`. The build downloads the CTR-ModSDK symbol map from a pinned commit
+into `data/`; if the download fails it builds without it. Only the USA release (SCUS-94426) is
+supported, and the extracted executable and overlays are checked against known hashes.
 
 ## Controls
 
@@ -114,3 +138,20 @@ corrected and appear 33% wider.
 * `--prim-log`: per-frame primitive buffer usage. `-v`: verbose log (CD, BIOS, SPU levels).
 * Crashes print a host backtrace (`tools/symbolize.sh build/run_err.txt`) and dump RAM to
   `build/crash_ram.bin`.
+
+## Credits
+
+* [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) (decompilation project, GPL-3.0): the
+  symbol map used for function names and extra discovery seeds (downloaded at build time, not
+  redistributed), documentation of the game's systems, and the 16BY9 widescreen mod that
+  showed which camera functions to patch.
+* [psx-spx](https://psx-spx.consoledev.net/) (PlayStation hardware documentation): GTE, GPU,
+  SPU, CD-ROM and timing behaviour.
+* [SDL2](https://www.libsdl.org/) for video, audio and input.
+
+Crash Team Racing is a trademark of its respective owners. This project is not affiliated with
+or endorsed by them, and is intended for use with a legally owned copy of the game.
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE).

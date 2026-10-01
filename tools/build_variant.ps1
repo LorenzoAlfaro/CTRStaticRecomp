@@ -10,7 +10,7 @@ $env:PATH = "$($llvm.FullName)\bin;$($ninja.FullName);C:\Program Files\CMake\bin
 $saved = @{}
 foreach ($k in $Env.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
 try {
-    python gen/recomp.py --data data --out "build/gen_$Name" --syms ..\CTRRecomp\symbols\syms926.txt | Out-Null
+    python gen/recomp.py --data data --out "build/gen_$Name" --syms data/syms926.txt | Out-Null
     if ($LASTEXITCODE) { throw "recompiler failed" }
 } finally {
     foreach ($k in $Env.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
