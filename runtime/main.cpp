@@ -25,8 +25,11 @@ static SDL_Renderer* renderer = nullptr;
 static SDL_Texture* texture = nullptr;
 static int tex_w = 0, tex_h = 0;
 static SDL_AudioDeviceID audio_dev = 0;
-static SDL_GameController* gamepad = nullptr;
-static SDL_Joystick* joystick = nullptr;  // fallback for devices without a controller mapping
+// every connected controller is read and their inputs combined: devices SDL has a mapping
+// for use the standard layout, others (e.g. vJoy, DirectInput pads without a mapping) a
+// generic one
+static std::vector<SDL_GameController*> gamepads;
+static std::vector<SDL_Joystick*> joysticks;
 static std::vector<uint32_t> frame(1024 * 512);
 static uint64_t frame_counter = 0;
 static double next_frame_time = 0;
@@ -166,7 +169,7 @@ static void update_pad() {
     if (k[SDL_SCANCODE_X]) press(15);
     if (k[SDL_SCANCODE_LEFTBRACKET]) press(1);
     if (k[SDL_SCANCODE_RIGHTBRACKET]) press(2);
-    if (gamepad) {
+    for (SDL_GameController* gamepad : gamepads) {
         auto btn = [&](SDL_GameControllerButton sb, int bit) { if (SDL_GameControllerGetButton(gamepad, sb)) press(bit); };
         btn(SDL_CONTROLLER_BUTTON_BACK, 0);
         btn(SDL_CONTROLLER_BUTTON_LEFTSTICK, 1);
@@ -191,7 +194,7 @@ static void update_pad() {
         if (ly < -12000) press(4);
         if (ly > 12000) press(6);
     }
-    if (!gamepad && joystick) {
+    for (SDL_Joystick* joystick : joysticks) {
         // generic layout: 0 X/Cross, 1 Circle, 2 Square, 3 Triangle, 4 L1, 5 R1, 6 L2, 7 R2, 8 Select, 9 Start
         static const int map[10] = {14, 13, 15, 12, 10, 11, 8, 9, 0, 3};
         int nb = std::min(SDL_JoystickNumButtons(joystick), 10);
@@ -217,37 +220,56 @@ static void update_pad() {
     g_pads[0].buttons = b;
 }
 
+static bool device_open(SDL_JoystickID id) {
+    for (SDL_GameController* g : gamepads)
+        if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g)) == id) return true;
+    for (SDL_Joystick* j : joysticks)
+        if (SDL_JoystickInstanceID(j) == id) return true;
+    return false;
+}
+
+static void open_device(int index) {
+    if (device_open(SDL_JoystickGetDeviceInstanceID(index))) return;
+    char guid[64];
+    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), guid, sizeof guid);
+    if (SDL_IsGameController(index)) {
+        if (SDL_GameController* g = SDL_GameControllerOpen(index)) {
+            gamepads.push_back(g);
+            LOGI("controller connected: '%s' (standard layout, guid %s)", SDL_GameControllerName(g), guid);
+        }
+        return;
+    }
+    if (SDL_Joystick* j = SDL_JoystickOpen(index)) {
+        joysticks.push_back(j);
+        LOGI("joystick connected: '%s' (generic layout: %d buttons, %d axes, %d hats, guid %s)", SDL_JoystickName(j),
+             SDL_JoystickNumButtons(j), SDL_JoystickNumAxes(j), SDL_JoystickNumHats(j), guid);
+    }
+}
+
+static void close_device(SDL_JoystickID id) {
+    for (size_t i = 0; i < gamepads.size(); i++)
+        if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gamepads[i])) == id) {
+            LOGI("controller disconnected: '%s'", SDL_GameControllerName(gamepads[i]));
+            SDL_GameControllerClose(gamepads[i]);
+            gamepads.erase(gamepads.begin() + i);
+            return;
+        }
+    for (size_t i = 0; i < joysticks.size(); i++)
+        if (SDL_JoystickInstanceID(joysticks[i]) == id) {
+            LOGI("joystick disconnected: '%s'", SDL_JoystickName(joysticks[i]));
+            SDL_JoystickClose(joysticks[i]);
+            joysticks.erase(joysticks.begin() + i);
+            return;
+        }
+}
+
 void frontend_poll_input() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_QUIT: g_quit = true; break;
-        case SDL_CONTROLLERDEVICEADDED:
-            if (!gamepad) {
-                gamepad = SDL_GameControllerOpen(e.cdevice.which);
-                if (gamepad) LOGI("controller connected: %s", SDL_GameControllerName(gamepad));
-            }
-            break;
-        case SDL_JOYDEVICEADDED:
-            if (!SDL_IsGameController(e.jdevice.which) && !joystick) {
-                joystick = SDL_JoystickOpen(e.jdevice.which);
-                if (joystick)
-                    LOGI("joystick '%s' connected (generic mapping: %d buttons, %d axes, %d hats)", SDL_JoystickName(joystick),
-                         SDL_JoystickNumButtons(joystick), SDL_JoystickNumAxes(joystick), SDL_JoystickNumHats(joystick));
-            }
-            break;
-        case SDL_JOYDEVICEREMOVED:
-            if (joystick && e.jdevice.which == SDL_JoystickInstanceID(joystick)) {
-                SDL_JoystickClose(joystick);
-                joystick = nullptr;
-            }
-            break;
-        case SDL_CONTROLLERDEVICEREMOVED:
-            if (gamepad && e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gamepad))) {
-                SDL_GameControllerClose(gamepad);
-                gamepad = nullptr;
-            }
-            break;
+        case SDL_JOYDEVICEADDED: open_device(e.jdevice.which); break;
+        case SDL_JOYDEVICEREMOVED: close_device(e.jdevice.which); break;
         case SDL_KEYDOWN:
             LOGD("key down: scancode %d (%s)", e.key.keysym.scancode, SDL_GetScancodeName(e.key.keysym.scancode));
             if (e.key.keysym.scancode == SDL_SCANCODE_F11 ||
@@ -471,6 +493,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // controllers keep working when the window is not focused
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -488,11 +512,7 @@ int main(int argc, char** argv) {
     want.samples = 1024;
     audio_dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (audio_dev) SDL_PauseAudioDevice(audio_dev, 0);
-    for (int i = 0; i < SDL_NumJoysticks(); i++)
-        if (SDL_IsGameController(i)) {
-            gamepad = SDL_GameControllerOpen(i);
-            if (gamepad) { LOGI("controller connected: %s", SDL_GameControllerName(gamepad)); break; }
-        }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) open_device(i);
 
     hw_init();
     cpu_init();
