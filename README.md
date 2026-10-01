@@ -5,6 +5,9 @@ The game's original MIPS R3000A machine code is translated to C at build time an
 a runtime that emulates the PS1 hardware underneath it, so the game runs as a native program
 rather than in an emulator.
 
+![Crash Cove at 4x internal resolution in 16:9](docs/images/hd_widescreen.jpg)
+*Crash Cove at 4x internal resolution with sub-pixel vertices and the 16:9 mode.*
+
 **No game code or data is included.** You need your own disc image: the build extracts the
 code from it, and the game reads its data from it at run time.
 
