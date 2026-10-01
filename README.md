@@ -72,7 +72,9 @@ Ninja-build.Ninja MartinStorsjo.LLVM-MinGW.UCRT`). SDL2 is downloaded by CMake.
 Run `build.ps1` from PowerShell 7 (`pwsh`). The disc path is remembered in `ctr_disc.txt`; the
 log is written to `ctr.log`. The build downloads the CTR-ModSDK symbol map from a pinned commit
 into `data/`; if the download fails it builds without it. Only the USA release (SCUS-94426) is
-supported, and the extracted executable and overlays are checked against known hashes.
+supported. At startup the executable on the disc is checked against the one that was
+recompiled, so a build only runs with the disc it was built from; a modified disc needs its own
+build.
 
 ## Controls
 
