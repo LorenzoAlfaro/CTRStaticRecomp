@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "pgxp.h"
 #include "psx.h"
 
 extern "C" FILE* g_trace_file;
@@ -22,6 +23,7 @@ void bios_flush_cards();
 static SDL_Window* window = nullptr;
 static SDL_Renderer* renderer = nullptr;
 static SDL_Texture* texture = nullptr;
+static int tex_w = 0, tex_h = 0;
 static SDL_AudioDeviceID audio_dev = 0;
 static SDL_GameController* gamepad = nullptr;
 static SDL_Joystick* joystick = nullptr;  // fallback for devices without a controller mapping
@@ -69,9 +71,10 @@ static uint64_t shot_every = 0;
 static std::string shot_dir;
 static std::string shot_path;
 
+static int frame_w = 0, frame_h = 0;
+
 static void save_screenshot(const std::string& path) {
-    DisplayInfo d = gpu_display();
-    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(frame.data(), d.w, d.h, 32, d.w * 4, SDL_PIXELFORMAT_ARGB8888);
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(frame.data(), frame_w, frame_h, 32, frame_w * 4, SDL_PIXELFORMAT_ARGB8888);
     if (s) {
         SDL_SaveBMP(s, path.c_str());
         SDL_FreeSurface(s);
@@ -83,33 +86,36 @@ static double now_seconds() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-static void convert_display() {
+// size of the displayed picture (internal resolution; 24-bit video mode stays native)
+static void display_size(int& w, int& h) {
     DisplayInfo d = gpu_display();
-    const uint16_t* vram = gpu_vram();
-    int w = d.w, h = d.h;
+    int sc = d.rgb24 ? 1 : gpu_scale();
+    w = d.w * sc;
+    h = d.h * sc;
+}
+
+// displayed area -> ARGB rows at dst (pitch in pixels)
+static void convert_display(uint32_t* dst, int pitch, int w, int h) {
+    DisplayInfo d = gpu_display();
     if (!d.enabled) {
-        memset(frame.data(), 0, frame.size() * 4);
+        for (int y = 0; y < h; y++) memset(dst + (size_t)y * pitch, 0, (size_t)w * 4);
         return;
     }
-    if (d.rgb24) {
-        for (int y = 0; y < h; y++) {
-            const uint8_t* row = (const uint8_t*)&vram[((d.y + y) & 511) * 1024];
-            for (int x = 0; x < w; x++) {
-                int bx = (d.x * 2 + x * 3) % 2048;
-                uint8_t r = row[bx], g = row[(bx + 1) % 2048], b = row[(bx + 2) % 2048];
-                frame[y * w + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
-            }
-        }
+    if (!d.rgb24) {
+        gpu_convert_display(dst, pitch, d.x, d.y, d.w, d.h);
         return;
     }
+    gpu_sync();
     for (int y = 0; y < h; y++) {
-        const uint16_t* row = &vram[((d.y + y) & 511) * 1024];
-        uint32_t* out = &frame[y * w];
+        int vy = (d.y + y) & 511;
+        auto byte = [&](int bx) {
+            uint16_t p = gpu_vram_native((bx >> 1) & 1023, vy);
+            return (uint8_t)(bx & 1 ? p >> 8 : p);
+        };
         for (int x = 0; x < w; x++) {
-            uint16_t p = row[(d.x + x) & 1023];
-            uint32_t r = (p & 31) << 3, g = ((p >> 5) & 31) << 3, b = ((p >> 10) & 31) << 3;
-            r |= r >> 5; g |= g >> 5; b |= b >> 5;
-            out[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            int bx = (d.x * 2 + x * 3) % 2048;
+            uint8_t r = byte(bx), g = byte((bx + 1) % 2048), b = byte((bx + 2) % 2048);
+            dst[(size_t)y * pitch + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
 }
@@ -122,6 +128,9 @@ static void load_settings() {
     while (fgets(line, sizeof line, f)) {
         int v;
         if (sscanf(line, "widescreen=%d", &v) == 1) set_widescreen(v != 0);
+        if (sscanf(line, "scale=%d", &v) == 1) gpu_set_scale(v);
+        if (sscanf(line, "pgxp=%d", &v) == 1) g_pgxp = v != 0;
+        if (sscanf(line, "dither=%d", &v) == 1) gpu_set_dither(v != 0);
     }
     fclose(f);
 }
@@ -130,6 +139,9 @@ static void save_settings() {
     FILE* f = fopen("ctr.cfg", "w");
     if (!f) return;
     fprintf(f, "widescreen=%d\n", widescreen() ? 1 : 0);
+    fprintf(f, "scale=%d\n", gpu_scale());
+    fprintf(f, "pgxp=%d\n", g_pgxp ? 1 : 0);
+    fprintf(f, "dither=%d\n", gpu_dither() ? 1 : 0);
     fclose(f);
 }
 
@@ -243,6 +255,18 @@ void frontend_poll_input() {
                 bool fs = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
                 SDL_SetWindowFullscreen(window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F10) {  // internal resolution 1x -> 2x -> 4x
+                gpu_set_scale(gpu_scale() >= 4 ? 1 : gpu_scale() * 2);
+                save_settings();
+            }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F8) {
+                g_pgxp = !g_pgxp;
+                save_settings();
+            }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F7) {
+                gpu_set_dither(!gpu_dither());
+                save_settings();
+            }
             if (e.key.keysym.scancode == SDL_SCANCODE_F9) {
                 set_widescreen(!widescreen());
                 save_settings();
@@ -259,12 +283,37 @@ void frontend_poll_input() {
     update_pad();
 }
 
+extern uint64_t g_gpu_stalls, g_gpu_stall_why[4], g_gpu_copies;
+extern double g_gpu_wait_s, g_gpu_full_s;
+static bool profile = getenv("CTR_PROFILE") != nullptr;
+
 void frontend_vblank() {
     frame_counter++;
-    convert_display();
-    DisplayInfo d = gpu_display();
-    SDL_Rect src = {0, 0, d.w, d.h};
-    SDL_UpdateTexture(texture, &src, frame.data(), d.w * 4);
+    static double p_last = 0, p_sync = 0, p_conv = 0, p_present = 0;
+    double t0 = now_seconds();
+    gpu_sync();
+    double t1 = now_seconds();
+    display_size(frame_w, frame_h);
+    if (!texture || frame_w > tex_w || frame_h > tex_h) {
+        if (texture) SDL_DestroyTexture(texture);
+        tex_w = std::max(frame_w, 1024);
+        tex_h = std::max(frame_h, 512);
+        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h);
+    }
+    SDL_Rect src = {0, 0, frame_w, frame_h};
+    bool shot_now = (shot_frame && frame_counter == shot_frame) || (shot_every && frame_counter % shot_every == 0);
+    void* pixels;
+    int pitch;
+    if (!shot_now && SDL_LockTexture(texture, &src, &pixels, &pitch) == 0) {
+        convert_display((uint32_t*)pixels, pitch / 4, frame_w, frame_h);
+        SDL_UnlockTexture(texture);
+    } else {
+        // screenshots keep a copy of the frame
+        if (frame.size() < (size_t)frame_w * frame_h) frame.resize((size_t)frame_w * frame_h);
+        convert_display(frame.data(), frame_w, frame_w, frame_h);
+        SDL_UpdateTexture(texture, &src, frame.data(), frame_w * 4);
+    }
+    double t2 = now_seconds();
     int ww, wh;
     SDL_GetRendererOutputSize(renderer, &ww, &wh);
     // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a 16:9
@@ -277,6 +326,23 @@ void frontend_vblank() {
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, &src, &dst);
     SDL_RenderPresent(renderer);
+    if (profile) {
+        double t3 = now_seconds();
+        p_sync += t1 - t0; p_conv += t2 - t1; p_present += t3 - t2;
+        if (frame_counter % 300 == 0) {
+            double total = t3 - p_last;
+            LOGI("profile: %.2f ms/frame: emu %.2f, gpu wait %.2f, convert %.2f, present %.2f, stalls %.1f/frame (tex %llu upload %llu download %llu)",
+                 total * 1000 / 300, (total - p_sync - p_conv - p_present) * 1000 / 300, p_sync * 1000 / 300,
+                 p_conv * 1000 / 300, p_present * 1000 / 300, g_gpu_stalls / 300.0, (unsigned long long)g_gpu_stall_why[1],
+                 (unsigned long long)g_gpu_stall_why[2], (unsigned long long)g_gpu_stall_why[3]);
+            memset(g_gpu_stall_why, 0, sizeof g_gpu_stall_why);
+            LOGI("profile: gpu sync wait %.2f ms/frame (incl. vblank), queue full %.2f ms/frame, vram copies %.1f/frame",
+                 g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
+            g_gpu_wait_s = g_gpu_full_s = 0;
+            g_gpu_copies = 0;
+            p_last = t3; p_sync = p_conv = p_present = 0; g_gpu_stalls = 0;
+        }
+    }
     if (shot_frame && frame_counter == shot_frame) save_screenshot(shot_path);
     if (shot_every && frame_counter % shot_every == 0) {
         char name[64];
@@ -313,8 +379,8 @@ void frontend_vblank() {
     if (fps_t == 0) fps_t = t;
     if (t - fps_t >= 1.0) {
         char title[128];
-        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps%s", (frame_counter - fps_n) / (t - fps_t),
-                 widescreen() ? " - 16:9" : "");
+        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps%s - %dx%s", (frame_counter - fps_n) / (t - fps_t),
+                 widescreen() ? " - 16:9" : "", gpu_scale(), g_pgxp ? " PGXP" : "");
         SDL_SetWindowTitle(window, title);
         fps_t = t;
         fps_n = frame_counter;
@@ -360,11 +426,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s <CTR (USA).cue|.bin>\n  (or put the path in ctr_disc.txt)\n", argv[0]);
         return 1;
     }
+    // defaults: 4x internal resolution with sub-pixel vertices (ctr.cfg / options override)
+    gpu_set_scale(4);
+    g_pgxp = true;
     load_settings();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--widescreen")) set_widescreen(true);
         else if (!strcmp(argv[i], "--no-widescreen")) set_widescreen(false);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) gpu_set_scale(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--pgxp")) g_pgxp = true;
+        else if (!strcmp(argv[i], "--no-pgxp")) g_pgxp = false;
+        else if (!strcmp(argv[i], "--dither")) gpu_set_dither(true);
+        else if (!strcmp(argv[i], "--no-dither")) gpu_set_dither(false);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
             shot_frame = strtoull(argv[++i], nullptr, 10);
@@ -407,7 +481,6 @@ int main(int argc, char** argv) {
     SDL_SetWindowInputFocus(window);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 1024, 512);
     SDL_AudioSpec want{}, have{};
     want.freq = 44100;
     want.format = AUDIO_S16SYS;

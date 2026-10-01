@@ -54,13 +54,39 @@ The disc path is remembered in `ctr_disc.txt`. The log is written to `ctr.log`.
 
 Keyboard: arrows = D-pad, C = Cross, V = Circle, X = Square, Z = Triangle, Enter = Start,
 Space = Select, LShift/RShift = L1/R1, LCtrl/RCtrl = L2/R2. F11 or Alt+Enter = fullscreen,
-Tab = fast forward, Pause = pause, F9 = toggle 16:9 widescreen (saved in `ctr.cfg`).
+Tab = fast forward, Pause = pause, F9 = 16:9 widescreen, F10 = internal resolution
+(1x/2x/4x), F8 = PGXP sub-pixel vertices, F7 = dithering. Settings are saved in `ctr.cfg`.
 
 Game controllers with an SDL mapping (Xbox/XInput, DualShock 4/DualSense, most common pads)
 use the standard layout (A = Cross, B = Circle, X = Square, Y = Triangle). Joysticks without a
 mapping (e.g. vJoy) use a generic layout: button 0 = Cross, 1 = Circle, 2 = Square,
 3 = Triangle, 4/5 = L1/R1, 6/7 = L2/R2, 8 = Select, 9 = Start, stick/hat = D-pad.
 Detected devices are listed in `ctr.log`.
+
+## HD rendering
+
+The GPU renders at 4x the native resolution by default (2048x864 for CTR's 512x216 screen).
+`--scale 1|2|4|8` or F10 changes it; `--scale 1 --no-pgxp` gives the original output exactly.
+
+* **Upscaled VRAM.** VRAM is kept at the internal resolution, each native pixel an NxN
+  block. CPU transfers, texture and CLUT fetches use the top-left sample of each block, so the
+  game sees the native 1024x512 VRAM while polygons, sprites and lines are drawn at full
+  resolution (`runtime/gpu.cpp`).
+* **PGXP.** The GTE rounds projected vertices to whole pixels, which is what makes PS1 geometry
+  wobble. RTPS/RTPT record the exact position of every vertex they output, keyed by the rounded
+  value; the GPU looks vertices up when they arrive and rasterizes with 1/256-pixel precision
+  (`runtime/pgxp.cpp`). A wrong match is off by less than one native pixel. `--no-pgxp` or F8
+  turns it off.
+* **Multithreaded.** Primitives are queued and rendered by worker threads (each owns
+  interleaved 8-line bands) while the emulated CPU keeps running. Hazard tracking on 16x8 tiles
+  drains the queue only when a primitive reads VRAM that queued work writes (render-to-texture)
+  or writes VRAM that queued work reads, so results are identical to single-threaded
+  rendering. Display conversion runs on the workers too.
+* **Dithering** uses the native 4x4 pattern scaled up; `--no-dither` or F7 turns it off.
+
+Performance on a Ryzen 5 3600 during a race: about 8 ms per frame at 4x (well within the
+16.7 ms of a 60 Hz frame). `CTR_PROFILE=1` logs a per-frame breakdown every 300 frames,
+`CTR_GPU_THREADS=N` sets the number of render threads.
 
 ## Widescreen
 

@@ -82,7 +82,14 @@ struct DisplayInfo {
     bool enabled;
 };
 DisplayInfo gpu_display();
-const uint16_t* gpu_vram();
+const uint16_t* gpu_vram();  // internal resolution: (1024*scale) x (512*scale)
+uint16_t gpu_vram_native(int x, int y);
+void gpu_sync();  // finish queued rendering before reading VRAM
+void gpu_convert_display(uint32_t* dst, int pitch_px, int x, int y, int w, int h);
+int gpu_scale();
+void gpu_set_scale(int scale);  // 1, 2, 4 or 8 (rounded down to a power of two)
+void gpu_set_dither(bool on);
+bool gpu_dither();
 
 // ---- enhancements (hooks.cpp) -------------------------------------------------------
 void set_widescreen(bool on);

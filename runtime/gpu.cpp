@@ -1,12 +1,32 @@
-// PS1 GPU: command processing and a software rasterizer into 1 MiB VRAM.
-#include <algorithm>
-#include <cstring>
+// PS1 GPU: command processing and a software rasterizer.
+//
+// VRAM is stored at an internal resolution scale S (1, 2, 4 or 8): every native VRAM pixel
+// is an SxS block. CPU uploads write whole blocks; CPU downloads, texture and CLUT fetches
+// read the top-left sample of a block, so the emulated machine sees exactly the native
+// 1024x512 VRAM. Polygons, rectangles and lines are rasterized at the full internal
+// resolution, with sub-pixel vertex positions from the GTE when PGXP is enabled.
+// At S=1 without PGXP the output is identical to a native-resolution renderer.
+#include <immintrin.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "pgxp.h"
 #include "psx.h"
 
 namespace psx {
 
-static uint16_t vram[512 * 1024];
+static int sh = 0;                    // log2(scale)
+static int VW = 1024, VH = 512;       // internal VRAM size
+static std::vector<uint16_t> vram(1024 * 512);
+static int dither_mode = 1;           // 0 off, 1 native pattern (scaled up)
 
 // ---- state -----------------------------------------------------------------------
 static uint32_t stat_texpage = 0;   // GP0 E1 bits 0..10 (+ texture disable bit 11)
@@ -41,21 +61,49 @@ static struct {
     int x, y, w, h, cx, cy;
 } upload, download;
 
-// ---- helpers -----------------------------------------------------------------------
-static inline uint16_t& px(int x, int y) { return vram[((y & 511) << 10) | (x & 1023)]; }
+// ---- VRAM access -------------------------------------------------------------------
+// internal-resolution pixel
+static inline uint16_t& hpx(int x, int y) {
+    return vram[((size_t)((unsigned)y & (unsigned)(VH - 1)) << (10 + sh)) | ((unsigned)x & (unsigned)(VW - 1))];
+}
+// native pixel (top-left sample of its block)
+static inline uint16_t& px(int x, int y) { return hpx((int)((unsigned)x << sh), (int)((unsigned)y << sh)); }
+// write a whole native pixel block
+static inline void px_fill(int x, int y, uint16_t v) {
+    int s = 1 << sh;
+    for (int j = 0; j < s; j++) {
+        uint16_t* row = &hpx((int)((unsigned)x << sh), (int)((unsigned)y << sh) + j);
+        for (int i = 0; i < s; i++) row[i] = v;
+    }
+}
+
+constexpr int SUB = 8;  // sub-pixel bits of vertex positions (internal-resolution pixels)
 
 struct Vertex {
-    int x, y;
+    int32_t x, y;  // internal-resolution position, SUB fractional bits
+    int nx, ny;    // native integer position (for the GPU's size limits)
     int r, g, b;
     int u, v;
 };
 
+// Everything a primitive needs, captured when it is queued (workers render it later).
 struct DrawCtx {
     bool textured, raw, semi, gouraud;
     int semi_mode;
     int tp_x, tp_y, tp_depth;  // texpage base (pixels) and depth 0=4bit 1=8bit 2=15bit
     int clut_x, clut_y;
     bool do_dither;
+    bool mask_set, mask_check;
+    uint8_t tw_mask_x, tw_mask_y, tw_off_x, tw_off_y;
+    int16_t da_x1, da_y1, da_x2, da_y2;
+};
+
+// Rows of the internal-resolution VRAM are split into bands of 8 lines, dealt round-robin
+// to the render workers; a worker only touches its own rows, so every pixel still sees
+// its primitives in submission order.
+struct Band {
+    int id, n;
+    bool mine(int y) const { return n == 1 || ((unsigned)(y >> 3) % (unsigned)n) == (unsigned)id; }
 };
 
 static const int dither_tab[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
@@ -63,8 +111,8 @@ static const int dither_tab[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4,
 static inline uint16_t sample_tex(const DrawCtx& d, int u, int v) {
     u &= 0xFF;
     v &= 0xFF;
-    u = (int)((u & ~(tw_mask_x * 8)) | ((tw_off_x & tw_mask_x) * 8));
-    v = (int)((v & ~(tw_mask_y * 8)) | ((tw_off_y & tw_mask_y) * 8));
+    u = (u & ~(d.tw_mask_x * 8)) | ((d.tw_off_x & d.tw_mask_x) * 8);
+    v = (v & ~(d.tw_mask_y * 8)) | ((d.tw_off_y & d.tw_mask_y) * 8);
     switch (d.tp_depth) {
     case 0: {
         uint16_t w = px(d.tp_x + (u >> 2), d.tp_y + v);
@@ -81,9 +129,10 @@ static inline uint16_t sample_tex(const DrawCtx& d, int u, int v) {
     }
 }
 
+// x, y: internal-resolution destination
 static inline void plot(const DrawCtx& d, int x, int y, int r, int g, int b, int u, int v) {
-    uint16_t& dst = px(x, y);
-    if (mask_check && (dst & 0x8000)) return;
+    uint16_t& dst = hpx(x, y);
+    if (d.mask_check && (dst & 0x8000)) return;
     uint16_t out;
     bool semi_px = d.semi;
     if (d.textured) {
@@ -93,7 +142,7 @@ static inline void plot(const DrawCtx& d, int x, int y, int r, int g, int b, int
         int tr = t & 31, tg = (t >> 5) & 31, tb = (t >> 10) & 31;
         if (!d.raw) {
             if (d.do_dither) {
-                int dt = dither_tab[y & 3][x & 3];
+                int dt = dither_tab[(y >> sh) & 3][(x >> sh) & 3];
                 int rr = std::clamp(((tr << 3) * r >> 7) + dt, 0, 255);
                 int gg = std::clamp(((tg << 3) * g >> 7) + dt, 0, 255);
                 int bb = std::clamp(((tb << 3) * b >> 7) + dt, 0, 255);
@@ -107,7 +156,7 @@ static inline void plot(const DrawCtx& d, int x, int y, int r, int g, int b, int
         out = (uint16_t)(tr | (tg << 5) | (tb << 10) | (t & 0x8000));
     } else {
         if (d.do_dither) {
-            int dt = dither_tab[y & 3][x & 3];
+            int dt = dither_tab[(y >> sh) & 3][(x >> sh) & 3];
             r = std::clamp(r + dt, 0, 255);
             g = std::clamp(g + dt, 0, 255);
             b = std::clamp(b + dt, 0, 255);
@@ -125,7 +174,7 @@ static inline void plot(const DrawCtx& d, int x, int y, int r, int g, int b, int
         }
         out = (uint16_t)(fr | (fg << 5) | (fb << 10) | (out & 0x8000));
     }
-    if (mask_set) out |= 0x8000;
+    if (d.mask_set) out |= 0x8000;
     dst = out;
 }
 
@@ -141,33 +190,40 @@ static DrawCtx make_ctx(uint32_t op, uint32_t texpage_word, uint32_t clut_word, 
     d.tp_depth = std::min<int>((tp >> 7) & 3, 2);
     d.clut_x = (clut_word & 0x3F) * 16;
     d.clut_y = (clut_word >> 6) & 0x1FF;
+    d.mask_set = mask_set;
+    d.mask_check = mask_check;
+    d.tw_mask_x = (uint8_t)tw_mask_x; d.tw_mask_y = (uint8_t)tw_mask_y;
+    d.tw_off_x = (uint8_t)tw_off_x; d.tw_off_y = (uint8_t)tw_off_y;
+    d.da_x1 = (int16_t)da_x1; d.da_y1 = (int16_t)da_y1; d.da_x2 = (int16_t)da_x2; d.da_y2 = (int16_t)da_y2;
     return d;
 }
 
 // ---- triangles ------------------------------------------------------------------------
-static inline int64_t edge(const Vertex& a, const Vertex& b, int x, int y) {
+static inline int64_t edge(const Vertex& a, const Vertex& b, int64_t x, int64_t y) {
     return (int64_t)(b.x - a.x) * (y - a.y) - (int64_t)(b.y - a.y) * (x - a.x);
 }
 
-static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2) {
+static inline int ceil_sub(int32_t v) { return (int)((v + (1 << SUB) - 1) >> SUB); }
+
+static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Band band) {
     int64_t area = edge(v0, v1, v2.x, v2.y);
     if (area == 0) return;
     if (area < 0) { std::swap(v1, v2); area = -area; }
-    int minx = std::min({v0.x, v1.x, v2.x}), maxx = std::max({v0.x, v1.x, v2.x});
-    int miny = std::min({v0.y, v1.y, v2.y}), maxy = std::max({v0.y, v1.y, v2.y});
-    if (maxx - minx >= 1024 || maxy - miny >= 512) return;
-    minx = std::max(minx, da_x1); maxx = std::min(maxx, da_x2 + 1);
-    miny = std::max(miny, da_y1); maxy = std::min(maxy, da_y2 + 1);
+    // sample points are integer internal-resolution coordinates
+    int minx = ceil_sub(std::min({v0.x, v1.x, v2.x})), maxx = ceil_sub(std::max({v0.x, v1.x, v2.x}));
+    int miny = ceil_sub(std::min({v0.y, v1.y, v2.y})), maxy = ceil_sub(std::max({v0.y, v1.y, v2.y}));
+    minx = std::max(minx, d.da_x1 << sh); maxx = std::min(maxx, (d.da_x2 + 1) << sh);
+    miny = std::max(miny, d.da_y1 << sh); maxy = std::min(maxy, (d.da_y2 + 1) << sh);
     if (minx >= maxx || miny >= maxy) return;
 
-    // attribute gradients (fixed 16.16)
+    // attribute gradients per internal pixel (fixed 16.16)
+    const int64_t lim = (int64_t)1 << 40;
     auto grad = [&](int a0, int a1, int a2, int64_t& ddx, int64_t& ddy) {
-        // plane through (x_i, y_i, a_i)
         int64_t dx1 = v1.x - v0.x, dy1 = v1.y - v0.y, dx2 = v2.x - v0.x, dy2 = v2.y - v0.y;
         int64_t da1 = a1 - a0, da2 = a2 - a0;
         int64_t den = dx1 * dy2 - dx2 * dy1;
-        ddx = ((da1 * dy2 - da2 * dy1) << 16) / den;
-        ddy = ((da2 * dx1 - da1 * dx2) << 16) / den;
+        ddx = std::clamp(((da1 * dy2 - da2 * dy1) << (16 + SUB)) / den, -lim, lim);
+        ddy = std::clamp(((da2 * dx1 - da1 * dx2) << (16 + SUB)) / den, -lim, lim);
     };
     int64_t rdx = 0, rdy = 0, gdx = 0, gdy = 0, bdx = 0, bdy = 0, udx = 0, udy = 0, vdx = 0, vdy = 0;
     if (d.gouraud) {
@@ -187,66 +243,401 @@ static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2) {
     int bias0 = is_tl(v1, v2) ? 0 : -1;
     int bias1 = is_tl(v2, v0) ? 0 : -1;
     int bias2 = is_tl(v0, v1) ? 0 : -1;
+    const int64_t one = 1 << SUB;
+    int64_t s0 = -(int64_t)(v2.y - v1.y) * one, s1 = -(int64_t)(v0.y - v2.y) * one, s2 = -(int64_t)(v1.y - v0.y) * one;
 
+    // attribute value at (x, y) = a0 + (ddx * (x - x0) + ddy * (y - y0)), positions in SUB units
+    auto start = [&](int a0, int64_t ddx, int64_t ddy, int64_t fx, int64_t fy) {
+        return ((int64_t)a0 << 16) + ((ddx * fx + ddy * fy) >> SUB) + 0x8000;
+    };
     for (int y = miny; y < maxy; y++) {
-        int64_t w0 = edge(v1, v2, minx, y), w1 = edge(v2, v0, minx, y), w2 = edge(v0, v1, minx, y);
-        int64_t s0 = -(int64_t)(v2.y - v1.y), s1 = -(int64_t)(v0.y - v2.y), s2 = -(int64_t)(v1.y - v0.y);
-        for (int x = minx; x < maxx; x++, w0 += s0, w1 += s1, w2 += s2) {
-            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0) continue;
-            int64_t fx = x - v0.x, fy = y - v0.y;
+        if (!band.mine(y)) continue;
+        int64_t sx = (int64_t)minx << SUB, sy = (int64_t)y << SUB;
+        int64_t w0 = edge(v1, v2, sx, sy), w1 = edge(v2, v0, sx, sy), w2 = edge(v0, v1, sx, sy);
+        // skip the empty span left of the triangle on this row
+        int x = minx;
+        auto first_inside = [&](int64_t w, int64_t s, int bias) -> int64_t {
+            if (w + bias >= 0) return 0;
+            if (s <= 0) return INT64_MAX;
+            return (-(w + bias) + s - 1) / s;
+        };
+        int64_t skip = std::max({first_inside(w0, s0, bias0), first_inside(w1, s1, bias1), first_inside(w2, s2, bias2)});
+        if (skip >= maxx - minx) continue;
+        x += (int)skip;
+        w0 += s0 * skip; w1 += s1 * skip; w2 += s2 * skip;
+        int64_t fx = ((int64_t)x << SUB) - v0.x, fy = sy - v0.y;
+        int64_t ra = 0, ga = 0, ba = 0, ua = 0, va = 0;
+        if (d.gouraud) {
+            ra = start(v0.r, rdx, rdy, fx, fy);
+            ga = start(v0.g, gdx, gdy, fx, fy);
+            ba = start(v0.b, bdx, bdy, fx, fy);
+        }
+        if (d.textured) {
+            ua = start(v0.u, udx, udy, fx, fy);
+            va = start(v0.v, vdx, vdy, fx, fy);
+        }
+        for (; x < maxx; x++, w0 += s0, w1 += s1, w2 += s2, ra += rdx, ga += gdx, ba += bdx, ua += udx, va += vdx) {
+            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0) {
+                // convex: once inside, leaving means the span is done
+                if (x > minx + skip) break;
+                continue;
+            }
             int r = v0.r, g = v0.g, b = v0.b, u = 0, v = 0;
             if (d.gouraud) {
-                r = (int)((((int64_t)v0.r << 16) + rdx * fx + rdy * fy + 0x8000) >> 16);
-                g = (int)((((int64_t)v0.g << 16) + gdx * fx + gdy * fy + 0x8000) >> 16);
-                b = (int)((((int64_t)v0.b << 16) + bdx * fx + bdy * fy + 0x8000) >> 16);
-                r = std::clamp(r, 0, 255); g = std::clamp(g, 0, 255); b = std::clamp(b, 0, 255);
+                r = std::clamp((int)(ra >> 16), 0, 255);
+                g = std::clamp((int)(ga >> 16), 0, 255);
+                b = std::clamp((int)(ba >> 16), 0, 255);
             }
             if (d.textured) {
-                u = (int)((((int64_t)v0.u << 16) + udx * fx + udy * fy + 0x8000) >> 16);
-                v = (int)((((int64_t)v0.v << 16) + vdx * fx + vdy * fy + 0x8000) >> 16);
-                u = std::clamp(u, 0, 255); v = std::clamp(v, 0, 255);
+                u = std::clamp((int)(ua >> 16), 0, 255);
+                v = std::clamp((int)(va >> 16), 0, 255);
             }
             plot(d, x, y, r, g, b, u, v);
         }
     }
 }
 
-// ---- rectangles / lines ---------------------------------------------------------------
-static void draw_rect(const DrawCtx& d, int x, int y, int w, int h, int r, int g, int b, int u0, int v0) {
-    int x0 = std::max(x, da_x1), y0 = std::max(y, da_y1);
-    int x1 = std::min(x + w, da_x2 + 1), y1 = std::min(y + h, da_y2 + 1);
+// ---- rectangles / lines / fills ---------------------------------------------------------
+static void draw_rect(const DrawCtx& d, int x, int y, int w, int h, int r, int g, int b, int u0, int v0, Band band) {
+    int s = 1 << sh;
+    int x0 = std::max(x, (int)d.da_x1) * s, y0 = std::max(y, (int)d.da_y1) * s;
+    int x1 = std::min(x + w, d.da_x2 + 1) * s, y1 = std::min(y + h, d.da_y2 + 1) * s;
     DrawCtx dd = d;
     dd.do_dither = false;  // rectangles are never dithered
-    for (int yy = y0; yy < y1; yy++)
+    for (int yy = y0; yy < y1; yy++) {
+        if (!band.mine(yy)) continue;
         for (int xx = x0; xx < x1; xx++)
-            plot(dd, xx, yy, r, g, b, u0 + (xx - x), v0 + (yy - y));
+            plot(dd, xx, yy, r, g, b, u0 + ((xx - x * s) >> sh), v0 + ((yy - y * s) >> sh));
+    }
 }
 
-static void draw_line(const DrawCtx& d, Vertex a, Vertex b) {
-    int dx = b.x - a.x, dy = b.y - a.y;
+static void draw_line(const DrawCtx& d, Vertex a, Vertex b, Band band) {
+    int dx = b.nx - a.nx, dy = b.ny - a.ny;
     if (std::abs(dx) >= 1024 || std::abs(dy) >= 512) return;
     int n = std::max(std::abs(dx), std::abs(dy));
+    int s = 1 << sh;
     for (int i = 0; i <= n; i++) {
-        int x = n ? a.x + dx * i / n : a.x;
-        int y = n ? a.y + dy * i / n : a.y;
-        if (x < da_x1 || x > da_x2 || y < da_y1 || y > da_y2) continue;
+        int x = n ? a.nx + dx * i / n : a.nx;
+        int y = n ? a.ny + dy * i / n : a.ny;
+        if (x < d.da_x1 || x > d.da_x2 || y < d.da_y1 || y > d.da_y2) continue;
         int r = a.r, g = a.g, bb = a.b;
         if (d.gouraud && n) {
             r = a.r + (b.r - a.r) * i / n;
             g = a.g + (b.g - a.g) * i / n;
             bb = a.b + (b.b - a.b) * i / n;
         }
-        plot(d, x, y, r, g, bb, 0, 0);
+        for (int j = 0; j < s; j++) {
+            if (!band.mine(y * s + j)) continue;
+            for (int k = 0; k < s; k++) plot(d, x * s + k, y * s + j, r, g, bb, 0, 0);
+        }
     }
+}
+
+static void do_fill(int x, int y, int w, int h, uint16_t col, Band band) {
+    int s = 1 << sh;
+    for (int yy = 0; yy < h * s; yy++) {
+        int hy = (y * s + yy) & (VH - 1);
+        if (!band.mine(hy)) continue;
+        for (int xx = 0; xx < w * s; xx++) hpx(x * s + xx, hy) = col;
+    }
+}
+
+// ---- render queue -------------------------------------------------------------------------
+// At internal scales above 1x primitives are queued and rasterized by worker threads while
+// the emulated CPU keeps running. The queue is drained (gpu_sync) before anything reads
+// VRAM on the emulation thread, and before queuing a primitive whose texture/CLUT area may
+// have been written by primitives still in the queue (render-to-texture).
+enum JobKind : uint8_t { JOB_TRI, JOB_RECT, JOB_LINE, JOB_FILL, JOB_CONVERT, JOB_COPY };
+struct Job {
+    JobKind kind;
+    DrawCtx d;
+    Vertex v[3];  // triangle / line vertices; rect: v[0].nx/ny pos, v[1].nx/ny size, v[0].u/v
+    uint32_t* dst;  // JOB_CONVERT: ARGB output (v[0] = internal-res origin, v[1] = size)
+    int pitch;      // JOB_COPY: v[0] = src, v[1] = dst, v[2] = size (native, nx/ny)
+};
+
+static void do_copy(const Job& j, Band band) {
+    int sx = j.v[0].nx, sy = j.v[0].ny, dx = j.v[1].nx, dy = j.v[1].ny, w = j.v[2].nx, h = j.v[2].ny;
+    int s = 1 << sh;
+    for (int yy = 0; yy < h * s; yy++) {
+        if (!band.mine((dy * s + yy) & (VH - 1))) continue;
+        for (int xx = 0; xx < w * s; xx++) {
+            uint16_t src = hpx(sx * s + xx, sy * s + yy);
+            uint16_t& d = hpx(dx * s + xx, dy * s + yy);
+            if (j.d.mask_check && (d & 0x8000)) continue;
+            d = src | (j.d.mask_set ? 0x8000 : 0);
+        }
+    }
+}
+
+// 15-bit VRAM pixel -> ARGB8888
+static uint32_t rgb_lut[32768];
+static struct LutInit {
+    LutInit() {
+        for (uint32_t p = 0; p < 32768; p++) {
+            uint32_t r = (p & 31) << 3, g = ((p >> 5) & 31) << 3, b = ((p >> 10) & 31) << 3;
+            r |= r >> 5; g |= g >> 5; b |= b >> 5;
+            rgb_lut[p] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+} lut_init;
+
+static void do_convert(const Job& j, Band band) {
+    int x0 = j.v[0].nx, y0 = j.v[0].ny, w = j.v[1].nx, h = j.v[1].ny;
+    for (int y = 0; y < h; y++) {
+        int vy = (y0 + y) & (VH - 1);
+        if (!band.mine(vy)) continue;
+        const uint16_t* row = &vram[(size_t)vy << (10 + sh)];
+        uint32_t* out = j.dst + (size_t)y * j.pitch;
+        if (x0 + w <= VW) {
+            row += x0;
+            for (int x = 0; x < w; x++) out[x] = rgb_lut[row[x] & 0x7FFF];
+        } else {
+            for (int x = 0; x < w; x++) out[x] = rgb_lut[row[(x0 + x) & (VW - 1)] & 0x7FFF];
+        }
+    }
+}
+
+static constexpr int kQueueSize = 1 << 14;
+static Job queue[kQueueSize];
+static std::atomic<uint64_t> q_head{0};  // jobs published
+static int n_workers = 0;
+struct alignas(64) WorkerState {
+    std::atomic<uint64_t> done{0};
+    std::thread th;
+};
+static WorkerState* workers = nullptr;
+static std::atomic<bool> workers_quit{false};
+static std::mutex q_mutex;
+static std::condition_variable q_cv;
+static std::atomic<int> q_sleepers{0};
+static bool threaded = false;  // queue in use (scale > 1 and workers available)
+
+// Hazard tracking between the emulation thread and the workers: VRAM areas written and read
+// by queued jobs since the last sync, in 16x8 native-pixel tiles (8 rows, so a framebuffer
+// ending at line 215 does not overlap textures stored from line 216). A job is queued only if
+// it reads nothing pending to be written and writes nothing pending to be read; otherwise
+// the queue is drained first. Coordinates wrap around VRAM like the hardware does.
+struct Rgn { int x0, y0, x1, y1; };  // native, exclusive end
+struct TileMap {
+    uint64_t bits[64];
+    bool any;
+    static void norm(Rgn& r) {
+        if (r.x1 - r.x0 >= 1024) { r.x0 = 0; r.x1 = 1024; }
+        if (r.y1 - r.y0 >= 512) { r.y0 = 0; r.y1 = 512; }
+    }
+    void mark(Rgn r) {
+        norm(r);
+        if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
+        for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
+            for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++) bits[ty & 63] |= 1ull << (tx & 63);
+        any = true;
+    }
+    bool test(Rgn r) const {
+        if (!any) return false;
+        norm(r);
+        if (r.x1 <= r.x0 || r.y1 <= r.y0) return false;
+        for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
+            for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++)
+                if (bits[ty & 63] & (1ull << (tx & 63))) return true;
+        return false;
+    }
+    void clear() { memset(bits, 0, sizeof bits); any = false; }
+};
+static TileMap pend_write, pend_read;
+
+static void run_job(const Job& j, Band band) {
+    switch (j.kind) {
+    case JOB_TRI: draw_triangle(j.d, j.v[0], j.v[1], j.v[2], band); break;
+    case JOB_RECT:
+        draw_rect(j.d, j.v[0].nx, j.v[0].ny, j.v[1].nx, j.v[1].ny, j.v[0].r, j.v[0].g, j.v[0].b, j.v[0].u, j.v[0].v, band);
+        break;
+    case JOB_LINE: draw_line(j.d, j.v[0], j.v[1], band); break;
+    case JOB_FILL: do_fill(j.v[0].nx, j.v[0].ny, j.v[1].nx, j.v[1].ny, (uint16_t)j.v[0].r, band); break;
+    case JOB_CONVERT: do_convert(j, band); break;
+    case JOB_COPY: do_copy(j, band); break;
+    }
+}
+
+static void worker_main(int id) {
+    WorkerState& me = workers[id];
+    Band band{id, n_workers};
+    for (;;) {
+        uint64_t done = me.done.load(std::memory_order_relaxed);
+        uint64_t head = q_head.load(std::memory_order_acquire);
+        if (done < head) {
+            run_job(queue[done % kQueueSize], band);
+            me.done.store(done + 1, std::memory_order_release);
+            continue;
+        }
+        if (workers_quit.load()) return;
+        // brief spin, then sleep until new work is published
+        bool got = false;
+        for (int i = 0; i < 4000 && !got; i++) {
+            _mm_pause();
+            got = q_head.load(std::memory_order_acquire) > done;
+        }
+        if (got) continue;
+        std::unique_lock<std::mutex> lk(q_mutex);
+        q_sleepers++;
+        q_cv.wait_for(lk, std::chrono::milliseconds(2),
+                      [&] { return q_head.load(std::memory_order_acquire) > done || workers_quit.load(); });
+        q_sleepers--;
+    }
+}
+
+static uint64_t min_done() {
+    uint64_t m = UINT64_MAX;
+    for (int i = 0; i < n_workers; i++) m = std::min(m, workers[i].done.load(std::memory_order_acquire));
+    return m;
+}
+
+static void wake_workers() {
+    if (q_sleepers.load(std::memory_order_relaxed) > 0) {
+        std::lock_guard<std::mutex> lk(q_mutex);
+        q_cv.notify_all();
+    }
+}
+
+// wait until every queued primitive has been rendered
+uint64_t g_gpu_stalls = 0;  // syncs that had to wait (profiling)
+double g_gpu_wait_s = 0, g_gpu_full_s = 0;
+static double wall() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+uint64_t g_gpu_stall_why[4];  // 0 other, 1 texture hazard, 2 upload, 3 download
+
+static void gpu_sync_why(int why) {
+    if (threaded && min_done() < q_head.load(std::memory_order_relaxed)) g_gpu_stall_why[why]++;
+    gpu_sync();
+}
+
+void gpu_sync() {
+    if (!threaded) return;
+    uint64_t head = q_head.load(std::memory_order_relaxed);
+    if (min_done() < head) {
+        g_gpu_stalls++;
+        double t = wall();
+        wake_workers();
+        while (min_done() < head) _mm_pause();
+        g_gpu_wait_s += wall() - t;
+    }
+    pend_write.clear();
+    pend_read.clear();
+}
+
+static void submit(const Job& j) {
+    if (!threaded) {
+        run_job(j, Band{0, 1});
+        return;
+    }
+    uint64_t head = q_head.load(std::memory_order_relaxed);
+    if (head - min_done() >= kQueueSize) {
+        double t = wall();
+        wake_workers();
+        while (head - min_done() >= kQueueSize) _mm_pause();
+        g_gpu_full_s += wall() - t;
+    }
+    queue[head % kQueueSize] = j;
+    q_head.store(head + 1, std::memory_order_release);
+    if ((head & 31) == 0) wake_workers();
+}
+
+// native area a job writes (for hazard tracking)
+static int job_writes(const Job& j, Rgn* out) {
+    auto clip = [&](int x0, int y0, int x1, int y1) {
+        return Rgn{std::max(x0, (int)j.d.da_x1), std::max(y0, (int)j.d.da_y1), std::min(x1, j.d.da_x2 + 1),
+                   std::min(y1, j.d.da_y2 + 1)};
+    };
+    switch (j.kind) {
+    case JOB_TRI:
+        // sub-pixel (PGXP) vertices can lie up to 2 native pixels from the integer ones
+        out[0] = clip(std::min({j.v[0].nx, j.v[1].nx, j.v[2].nx}) - 2, std::min({j.v[0].ny, j.v[1].ny, j.v[2].ny}) - 2,
+                      std::max({j.v[0].nx, j.v[1].nx, j.v[2].nx}) + 2, std::max({j.v[0].ny, j.v[1].ny, j.v[2].ny}) + 2);
+        return 1;
+    case JOB_LINE:
+        out[0] = clip(std::min(j.v[0].nx, j.v[1].nx), std::min(j.v[0].ny, j.v[1].ny), std::max(j.v[0].nx, j.v[1].nx) + 1,
+                      std::max(j.v[0].ny, j.v[1].ny) + 1);
+        return 1;
+    case JOB_RECT:
+        out[0] = clip(j.v[0].nx, j.v[0].ny, j.v[0].nx + j.v[1].nx, j.v[0].ny + j.v[1].ny);
+        return 1;
+    case JOB_FILL:
+        out[0] = Rgn{j.v[0].nx, j.v[0].ny, j.v[0].nx + j.v[1].nx, j.v[0].ny + j.v[1].ny};
+        return 1;
+    case JOB_COPY:
+        out[0] = Rgn{j.v[1].nx, j.v[1].ny, j.v[1].nx + j.v[2].nx, j.v[1].ny + j.v[2].ny};
+        return 1;
+    case JOB_CONVERT: return 0;
+    }
+    return 0;
+}
+
+// texture page and CLUT area a textured primitive reads
+static int texture_reads(const DrawCtx& d, int umin, int umax, int vmin, int vmax, Rgn* out) {
+    if (!d.textured) return 0;
+    int shift = d.tp_depth == 0 ? 2 : d.tp_depth == 1 ? 1 : 0;
+    if (d.tw_mask_x || umin < 0 || umax > 255) { umin = 0; umax = 255; }
+    if (d.tw_mask_y || vmin < 0 || vmax > 255) { vmin = 0; vmax = 255; }
+    out[0] = Rgn{d.tp_x + (umin >> shift), d.tp_y + vmin, d.tp_x + (umax >> shift) + 1, d.tp_y + vmax + 1};
+    if (d.tp_depth == 2) return 1;
+    out[1] = Rgn{d.clut_x, d.clut_y, d.clut_x + (d.tp_depth == 0 ? 16 : 256), d.clut_y + 1};
+    return 2;
+}
+
+static void queue_job(const Job& j, const Rgn* reads = nullptr, int nreads = 0) {
+    if (threaded) {
+        Rgn w[1];
+        int nw = job_writes(j, w);
+        bool hz = false;
+        for (int i = 0; i < nreads && !hz; i++) hz = pend_write.test(reads[i]);  // read after write
+        bool raw = hz;
+        for (int i = 0; i < nw && !hz; i++) hz = pend_read.test(w[i]);  // write after read
+        if (hz) {
+            static int logged = 0;
+            if (logged < 40 && getenv("CTR_HAZARD_LOG")) {
+                logged++;
+                LOGI("hazard (%s) job %d: write %d,%d-%d,%d read %d,%d-%d,%d", raw ? "RAW" : "WAR", j.kind, nw ? w[0].x0 : 0,
+                     nw ? w[0].y0 : 0, nw ? w[0].x1 : 0, nw ? w[0].y1 : 0, nreads ? reads[0].x0 : 0, nreads ? reads[0].y0 : 0,
+                     nreads ? reads[0].x1 : 0, nreads ? reads[0].y1 : 0);
+            }
+            gpu_sync_why(1);
+        }
+        for (int i = 0; i < nw; i++) pend_write.mark(w[i]);
+        for (int i = 0; i < nreads; i++) pend_read.mark(reads[i]);
+    }
+    submit(j);
+}
+
+static void draw_triangle_q(const DrawCtx& d, const Vertex& a, const Vertex& b, const Vertex& c) {
+    // the GPU rejects polygons larger than 1023x511 (native)
+    if (std::max({a.nx, b.nx, c.nx}) - std::min({a.nx, b.nx, c.nx}) >= 1024 ||
+        std::max({a.ny, b.ny, c.ny}) - std::min({a.ny, b.ny, c.ny}) >= 512)
+        return;
+    Rgn rd[2];
+    int nr = texture_reads(d, std::min({a.u, b.u, c.u}), std::max({a.u, b.u, c.u}), std::min({a.v, b.v, c.v}),
+                           std::max({a.v, b.v, c.v}), rd);
+    Job j;
+    j.kind = JOB_TRI;
+    j.d = d;
+    j.v[0] = a; j.v[1] = b; j.v[2] = c;
+    queue_job(j, rd, nr);
 }
 
 // ---- command decoding ------------------------------------------------------------------
 static inline int sx11(uint32_t v) { return ((int32_t)(v << 21)) >> 21; }
 
-static Vertex read_vertex(const uint32_t* w, uint32_t color) {
+static Vertex read_vertex(const uint32_t* w, uint32_t color, bool precise = false) {
     Vertex v;
-    v.x = sx11(w[0] & 0xFFFF) + off_x;
-    v.y = sx11(w[0] >> 16) + off_y;
+    v.nx = sx11(w[0] & 0xFFFF) + off_x;
+    v.ny = sx11(w[0] >> 16) + off_y;
+    float fx, fy;
+    if (precise && g_pgxp && pgxp_lookup(w[0], &fx, &fy, nullptr)) {
+        float k = (float)(1 << (sh + SUB));
+        v.x = (int32_t)std::lround((fx - (int16_t)(w[0] & 0xFFFF) + v.nx) * k);
+        v.y = (int32_t)std::lround((fy - (int16_t)(w[0] >> 16) + v.ny) * k);
+    } else {
+        v.x = v.nx * (1 << (sh + SUB));
+        v.y = v.ny * (1 << (sh + SUB));
+    }
     v.r = color & 0xFF;
     v.g = (color >> 8) & 0xFF;
     v.b = (color >> 16) & 0xFF;
@@ -271,7 +662,7 @@ static void exec_polygon() {
     for (int k = 0; k < n; k++) {
         if (gour && k > 0) color = cmd[i] & 0xFFFFFF;
         if (k == 0 || gour) i++;
-        v[k] = read_vertex(&cmd[i++], color);
+        v[k] = read_vertex(&cmd[i++], color, true);
         if (tex) {
             uint32_t t = cmd[i++];
             v[k].u = t & 0xFF;
@@ -282,15 +673,15 @@ static void exec_polygon() {
     }
     DrawCtx d = make_ctx(op, tpage, clut, tex);
     d.gouraud = gour;
-    d.do_dither = dither && (gour || (d.textured && !d.raw));
+    d.do_dither = dither_mode && dither && (gour || (d.textured && !d.raw));
     if (tex) {
         // polygon texpage updates the global texpage (bits 0-8, 11)
         stat_texpage = (stat_texpage & ~0x9FFu) | (tpage & 0x9FF);
     }
     if (!gour) for (int k = 1; k < n; k++) { v[k].r = v[0].r; v[k].g = v[0].g; v[k].b = v[0].b; }
     if (d.raw) for (int k = 0; k < n; k++) v[k].r = v[k].g = v[k].b = 128;
-    draw_triangle(d, v[0], v[1], v[2]);
-    if (quad) draw_triangle(d, v[1], v[2], v[3]);
+    draw_triangle_q(d, v[0], v[1], v[2]);
+    if (quad) draw_triangle_q(d, v[1], v[2], v[3]);
 }
 
 static void exec_rect() {
@@ -315,40 +706,83 @@ static void exec_rect() {
     else w = h = 16;
     DrawCtx d = make_ctx(op, stat_texpage, clut, tex);
     d.gouraud = false;
-    int r = p.r, g = p.g, b = p.b;
-    if (d.raw) r = g = b = 128;
-    draw_rect(d, p.x, p.y, w, h, r, g, b, u, v);
+    Rgn rd[2];
+    int nr = texture_reads(d, u, u + w - 1, v, v + h - 1, rd);
+    Job j;
+    j.kind = JOB_RECT;
+    j.d = d;
+    j.v[0] = p;
+    j.v[0].u = u;
+    j.v[0].v = v;
+    if (d.raw) j.v[0].r = j.v[0].g = j.v[0].b = 128;
+    j.v[1].nx = w;
+    j.v[1].ny = h;
+    queue_job(j, rd, nr);
 }
 
 static void exec_line_segment(const uint32_t* w0, uint32_t c0, const uint32_t* w1, uint32_t c1, uint32_t op) {
     DrawCtx d = make_ctx(op, stat_texpage, 0, false);
     d.gouraud = op & 0x10;
-    d.do_dither = dither && d.gouraud;
-    draw_line(d, read_vertex(w0, c0), read_vertex(w1, c1));
+    d.do_dither = dither_mode && dither && d.gouraud;
+    Job j;
+    j.kind = JOB_LINE;
+    j.d = d;
+    j.v[0] = read_vertex(w0, c0);
+    j.v[1] = read_vertex(w1, c1);
+    queue_job(j);
 }
 
 static void fill_rect() {
     uint32_t c = cmd[0];
-    int x = cmd[1] & 0x3F0, y = (cmd[1] >> 16) & 0x1FF;
-    int w = ((cmd[2] & 0x3FF) + 0xF) & ~0xF, h = (cmd[2] >> 16) & 0x1FF;
-    uint16_t col = (uint16_t)(((c >> 3) & 31) | (((c >> 11) & 31) << 5) | (((c >> 19) & 31) << 10));
-    for (int yy = 0; yy < h; yy++)
-        for (int xx = 0; xx < w; xx++) px(x + xx, y + yy) = col;
+    Job j;
+    j.kind = JOB_FILL;
+    j.d = DrawCtx{};
+    j.v[0].nx = cmd[1] & 0x3F0;
+    j.v[0].ny = (cmd[1] >> 16) & 0x1FF;
+    j.v[1].nx = ((cmd[2] & 0x3FF) + 0xF) & ~0xF;
+    j.v[1].ny = (cmd[2] >> 16) & 0x1FF;
+    j.v[0].r = (int)(((c >> 3) & 31) | (((c >> 11) & 31) << 5) | (((c >> 19) & 31) << 10));
+    queue_job(j);
 }
 
+uint64_t g_gpu_copies = 0;
 static void vram_copy() {
-    int sx = cmd[1] & 0x3FF, sy = (cmd[1] >> 16) & 0x1FF;
-    int dx = cmd[2] & 0x3FF, dy = (cmd[2] >> 16) & 0x1FF;
-    int w = cmd[3] & 0x3FF, h = (cmd[3] >> 16) & 0x1FF;
-    if (!w) w = 0x400;
-    if (!h) h = 0x200;
-    for (int yy = 0; yy < h; yy++)
-        for (int xx = 0; xx < w; xx++) {
-            uint16_t s = px(sx + xx, sy + yy);
-            uint16_t& d = px(dx + xx, dy + yy);
-            if (mask_check && (d & 0x8000)) continue;
-            d = s | (mask_set ? 0x8000 : 0);
-        }
+    g_gpu_copies++;
+    Job j;
+    j.kind = JOB_COPY;
+    j.d = DrawCtx{};
+    j.d.mask_set = mask_set;
+    j.d.mask_check = mask_check;
+    j.v[0].nx = cmd[1] & 0x3FF; j.v[0].ny = (cmd[1] >> 16) & 0x1FF;
+    j.v[1].nx = cmd[2] & 0x3FF; j.v[1].ny = (cmd[2] >> 16) & 0x1FF;
+    j.v[2].nx = cmd[3] & 0x3FF; j.v[2].ny = (cmd[3] >> 16) & 0x1FF;
+    if (!j.v[2].nx) j.v[2].nx = 0x400;
+    if (!j.v[2].ny) j.v[2].ny = 0x200;
+    if (j.v[0].ny == j.v[1].ny) {
+        // source and destination rows are the same: one worker does each row in order
+        queue_job(j);
+        return;
+    }
+    Rgn src{j.v[0].nx, j.v[0].ny, j.v[0].nx + j.v[2].nx, j.v[0].ny + j.v[2].ny};
+    Rgn dst{j.v[1].nx, j.v[1].ny, j.v[1].nx + j.v[2].nx, j.v[1].ny + j.v[2].ny};
+    TileMap t{};
+    t.mark(src);
+    if (t.test(dst)) {
+        // a copy between different but overlapping rows depends on row order: do it here
+        gpu_sync();
+        run_job(j, Band{0, 1});
+        return;
+    }
+    queue_job(j, &src, 1);
+}
+
+static void start_workers() {
+    unsigned hc = std::thread::hardware_concurrency();
+    n_workers = (int)std::clamp<unsigned>(hc > 2 ? hc - 2 : 1, 1, 12);
+    if (const char* e = getenv("CTR_GPU_THREADS")) n_workers = std::clamp(atoi(e), 1, 32);
+    workers = new WorkerState[n_workers];
+    for (int i = 0; i < n_workers; i++) workers[i].th = std::thread(worker_main, i);
+    LOGI("GPU: %d render threads", n_workers);
 }
 
 static int command_length(uint32_t w) {
@@ -381,6 +815,7 @@ static void exec_command() {
     case 3: exec_rect(); return;
     case 4: vram_copy(); return;
     case 5: {
+        gpu_sync_why(2);  // uploads are written directly by the emulation thread
         upload.active = true;
         upload.x = cmd[1] & 0x3FF; upload.y = (cmd[1] >> 16) & 0x1FF;
         upload.w = ((cmd[2] & 0xFFFF) - 1) % 1024 + 1; upload.h = (((cmd[2] >> 16) & 0xFFFF) - 1) % 512 + 1;
@@ -388,6 +823,7 @@ static void exec_command() {
         return;
     }
     case 6: {
+        gpu_sync_why(3);
         download.active = true;
         download.x = cmd[1] & 0x3FF; download.y = (cmd[1] >> 16) & 0x1FF;
         download.w = ((cmd[2] & 0xFFFF) - 1) % 1024 + 1; download.h = (((cmd[2] >> 16) & 0xFFFF) - 1) % 512 + 1;
@@ -421,8 +857,8 @@ static void exec_command() {
 static void upload_word(uint32_t w) {
     for (int k = 0; k < 2 && upload.active; k++) {
         uint16_t p = (uint16_t)(k ? w >> 16 : w);
-        uint16_t& d = px(upload.x + upload.cx, upload.y + upload.cy);
-        if (!(mask_check && (d & 0x8000))) d = p | (mask_set ? 0x8000 : 0);
+        int x = upload.x + upload.cx, y = upload.y + upload.cy;
+        if (!(mask_check && (px(x, y) & 0x8000))) px_fill(x, y, p | (mask_set ? 0x8000 : 0));
         if (++upload.cx >= upload.w) {
             upload.cx = 0;
             if (++upload.cy >= upload.h) upload.active = false;
@@ -567,10 +1003,54 @@ DisplayInfo gpu_display() {
     return d;
 }
 
-const uint16_t* gpu_vram() { return vram; }
+const uint16_t* gpu_vram() { return vram.data(); }
+
+// Convert the displayed 15-bit area (native x, y, w, h) at internal resolution to ARGB,
+// on the render threads after all queued drawing. Returns when done.
+void gpu_convert_display(uint32_t* dst, int pitch_px, int x, int y, int w, int h) {
+    Job j;
+    j.kind = JOB_CONVERT;
+    j.v[0].nx = x << sh;
+    j.v[0].ny = y << sh;
+    j.v[1].nx = w << sh;
+    j.v[1].ny = h << sh;
+    j.dst = dst;
+    j.pitch = pitch_px;
+    submit(j);
+    gpu_sync();
+}
+uint16_t gpu_vram_native(int x, int y) { return px(x, y); }
+int gpu_scale() { return 1 << sh; }
+
+void gpu_set_scale(int scale) {
+    int nsh = 0;
+    while (nsh < 3 && (2 << nsh) <= scale) nsh++;
+    gpu_sync();
+    threaded = nsh > 0;
+    if (threaded && !workers) start_workers();
+    if (nsh == sh) return;
+    // resample the current contents so a change while running keeps the picture
+    std::vector<uint16_t> old;
+    old.swap(vram);
+    int osh = sh;
+    sh = nsh;
+    VW = 1024 << sh;
+    VH = 512 << sh;
+    vram.assign((size_t)VW * VH, 0);
+    for (int y = 0; y < VH; y++)
+        for (int x = 0; x < VW; x++) {
+            int ox = osh >= sh ? x << (osh - sh) : x >> (sh - osh);
+            int oy = osh >= sh ? y << (osh - sh) : y >> (sh - osh);
+            vram[((size_t)y << (10 + sh)) | x] = old[((size_t)oy << (10 + osh)) | ox];
+        }
+}
+
+void gpu_set_dither(bool on) { dither_mode = on ? 1 : 0; }
+bool gpu_dither() { return dither_mode != 0; }
 
 void gpu_init() {
-    memset(vram, 0, sizeof vram);
+    gpu_sync();
+    std::fill(vram.begin(), vram.end(), 0);
     gpu_write_gp1(0);
 }
 

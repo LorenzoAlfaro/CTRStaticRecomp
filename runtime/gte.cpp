@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "pgxp.h"
 #include "recomp.h"
 
 namespace {
@@ -153,7 +154,19 @@ void rtp(int n, int shift, bool lm, bool last) {
     int64_t sy = (int64_t)hs * g.IR[2] + g.OFY;
     check_mac0(sx);
     check_mac0(sy);
+    uint32_t flag_before = g.FLAG;
     push_sxy((int32_t)(sx >> 16), (int32_t)(sy >> 16));
+    // sub-pixel position of this vertex (no rounding of IR1/IR2 or SZ3, exact division)
+    if (psx::g_pgxp && !((g.FLAG & ~flag_before) & ((1u << 17) | (1u << 14) | (1u << 13))) && mac[2] > 0 &&
+        g.IR[1] == (int32_t)(mac[0] >> shift) && g.IR[2] == (int32_t)(mac[1] >> shift)) {
+        double z = (double)mac[2];  // view Z << 12
+        double scale = (double)g.H * 4096.0 / z;
+        double px = (double)mac[0] / (double)(1 << shift) * scale + g.OFX / 65536.0;
+        double py = (double)mac[1] / (double)(1 << shift) * scale + g.OFY / 65536.0;
+        int32_t ix = g.SXY[2][0], iy = g.SXY[2][1];
+        if (px > ix - 2 && px < ix + 2 && py > iy - 2 && py < iy + 2)
+            psx::pgxp_store((uint16_t)ix | ((uint32_t)(uint16_t)iy << 16), (float)px, (float)py, (float)(z / 4096.0));
+    }
     if (last) {
         int64_t dq = (int64_t)g.DQA * hs + g.DQB;
         check_mac0(dq);
