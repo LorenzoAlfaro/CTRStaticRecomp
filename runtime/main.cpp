@@ -124,6 +124,23 @@ static void convert_display(uint32_t* dst, int pitch, int w, int h) {
     }
 }
 
+// display aspect: 0 = 4:3 (original), 1 = 16:9, 2 = fill the window/screen (widescreen at the
+// window's aspect ratio, up to 21:9)
+enum { ASPECT_4_3, ASPECT_16_9, ASPECT_FILL, ASPECT_MODES };
+static int aspect_mode = ASPECT_4_3;
+static const char* aspect_names[ASPECT_MODES] = {"4:3", "16:9", "fill"};
+
+static void apply_aspect() {
+    double a = 4.0 / 3.0;
+    if (aspect_mode == ASPECT_16_9) a = 16.0 / 9.0;
+    if (aspect_mode == ASPECT_FILL && renderer) {
+        int ww = 0, wh = 0;
+        SDL_GetRendererOutputSize(renderer, &ww, &wh);
+        if (ww > 0 && wh > 0) a = (double)ww / wh;
+    }
+    if (a != aspect()) set_aspect(a);
+}
+
 // persistent user settings (ctr.cfg next to the game)
 static void load_settings() {
     FILE* f = fopen("ctr.cfg", "r");
@@ -131,7 +148,8 @@ static void load_settings() {
     char line[256];
     while (fgets(line, sizeof line, f)) {
         int v;
-        if (sscanf(line, "widescreen=%d", &v) == 1) set_widescreen(v != 0);
+        if (sscanf(line, "widescreen=%d", &v) == 1) aspect_mode = v ? ASPECT_16_9 : ASPECT_4_3;  // older ctr.cfg
+        if (sscanf(line, "aspect=%d", &v) == 1 && v >= 0 && v < ASPECT_MODES) aspect_mode = v;
         if (sscanf(line, "scale=%d", &v) == 1) gpu_set_scale(v);
         if (sscanf(line, "pgxp=%d", &v) == 1) g_pgxp = v != 0;
         if (sscanf(line, "dither=%d", &v) == 1) gpu_set_dither(v != 0);
@@ -142,14 +160,42 @@ static void load_settings() {
 static void save_settings() {
     FILE* f = fopen("ctr.cfg", "w");
     if (!f) return;
-    fprintf(f, "widescreen=%d\n", widescreen() ? 1 : 0);
+    fprintf(f, "aspect=%d\n", aspect_mode);
     fprintf(f, "scale=%d\n", gpu_scale());
     fprintf(f, "pgxp=%d\n", g_pgxp ? 1 : 0);
     fprintf(f, "dither=%d\n", gpu_dither() ? 1 : 0);
     fclose(f);
 }
 
+static void cycle_aspect() {
+    aspect_mode = (aspect_mode + 1) % ASPECT_MODES;
+    LOGI("aspect: %s", aspect_names[aspect_mode]);
+    save_settings();
+}
+
+static void cycle_scale() {
+    gpu_set_scale(gpu_scale() >= 4 ? 1 : gpu_scale() * 2);
+    LOGI("internal resolution: %dx", gpu_scale());
+    save_settings();
+}
+
+// controller hotkeys on the stick buttons, which the digital pad doesn't have:
+// left stick click = aspect mode, right stick click = internal resolution
+static void controller_hotkeys() {
+    static bool prev_l = false, prev_r = false;
+    bool l = false, r = false;
+    for (SDL_GameController* g : gamepads) {
+        l |= SDL_GameControllerGetButton(g, SDL_CONTROLLER_BUTTON_LEFTSTICK) != 0;
+        r |= SDL_GameControllerGetButton(g, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+    }
+    if (l && !prev_l) cycle_aspect();
+    if (r && !prev_r) cycle_scale();
+    prev_l = l;
+    prev_r = r;
+}
+
 static void update_pad() {
+    controller_hotkeys();
     const uint8_t* k = SDL_GetKeyboardState(nullptr);
     uint16_t b = 0xFFFF;
     auto press = [&](int bit) { b &= ~(1u << bit); };
@@ -173,8 +219,6 @@ static void update_pad() {
     for (SDL_GameController* gamepad : gamepads) {
         auto btn = [&](SDL_GameControllerButton sb, int bit) { if (SDL_GameControllerGetButton(gamepad, sb)) press(bit); };
         btn(SDL_CONTROLLER_BUTTON_BACK, 0);
-        btn(SDL_CONTROLLER_BUTTON_LEFTSTICK, 1);
-        btn(SDL_CONTROLLER_BUTTON_RIGHTSTICK, 2);
         btn(SDL_CONTROLLER_BUTTON_START, 3);
         btn(SDL_CONTROLLER_BUTTON_DPAD_UP, 4);
         btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 5);
@@ -278,10 +322,7 @@ void frontend_poll_input() {
                 bool fs = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
                 SDL_SetWindowFullscreen(window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
-            if (e.key.keysym.scancode == SDL_SCANCODE_F10) {  // internal resolution 1x -> 2x -> 4x
-                gpu_set_scale(gpu_scale() >= 4 ? 1 : gpu_scale() * 2);
-                save_settings();
-            }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F10) cycle_scale();  // 1x -> 2x -> 4x
             if (e.key.keysym.scancode == SDL_SCANCODE_F8) {
                 g_pgxp = !g_pgxp;
                 save_settings();
@@ -290,10 +331,7 @@ void frontend_poll_input() {
                 gpu_set_dither(!gpu_dither());
                 save_settings();
             }
-            if (e.key.keysym.scancode == SDL_SCANCODE_F9) {
-                set_widescreen(!widescreen());
-                save_settings();
-            }
+            if (e.key.keysym.scancode == SDL_SCANCODE_F9) cycle_aspect();  // 4:3 -> 16:9 -> fill
             if (e.key.keysym.scancode == SDL_SCANCODE_TAB) fast_forward = true;
             if (e.key.keysym.scancode == SDL_SCANCODE_PAUSE) paused = !paused;
             break;
@@ -339,11 +377,12 @@ void frontend_vblank() {
     double t2 = now_seconds();
     int ww, wh;
     SDL_GetRendererOutputSize(renderer, &ww, &wh);
-    // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a 16:9
-    // field of view into the same buffer, shown stretched to 16:9
-    int ax = widescreen() ? 16 : 4, ay = widescreen() ? 9 : 3;
-    int dw = ww, dh = ww * ay / ax;
-    if (dh > wh) { dh = wh; dw = wh * ax / ay; }
+    // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a wider
+    // field of view into the same buffer, shown stretched to the target aspect
+    apply_aspect();  // follows window size changes in fill mode (takes effect next frame)
+    double a = aspect();
+    int dw = ww, dh = (int)(ww / a + 0.5);
+    if (dh > wh) { dh = wh; dw = (int)(wh * a + 0.5); }
     SDL_Rect dst = {(ww - dw) / 2, (wh - dh) / 2, dw, dh};
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -402,8 +441,9 @@ void frontend_vblank() {
     if (fps_t == 0) fps_t = t;
     if (t - fps_t >= 1.0) {
         char title[128];
-        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps%s - %dx%s", (frame_counter - fps_n) / (t - fps_t),
-                 widescreen() ? " - 16:9" : "", gpu_scale(), g_pgxp ? " PGXP" : "");
+        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps - %s (%.2f:1) - %dx%s",
+                 (frame_counter - fps_n) / (t - fps_t), aspect_names[aspect_mode], aspect(), gpu_scale(),
+                 g_pgxp ? " PGXP" : "");
         SDL_SetWindowTitle(window, title);
 #ifdef __ANDROID__
         // no window title on a phone: log it now and then
@@ -476,10 +516,11 @@ int main(int argc, char** argv) {
 #endif
         return 1;
     }
-    // defaults: 4x internal resolution with sub-pixel vertices, 2x on phones (ctr.cfg and
-    // options override)
+    // defaults: 4x internal resolution with sub-pixel vertices; on phones 2x and filling the
+    // screen (ctr.cfg and options override)
 #ifdef __ANDROID__
     gpu_set_scale(2);
+    aspect_mode = ASPECT_FILL;
 #else
     gpu_set_scale(4);
 #endif
@@ -487,8 +528,13 @@ int main(int argc, char** argv) {
     load_settings();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
-        else if (!strcmp(argv[i], "--widescreen")) set_widescreen(true);
-        else if (!strcmp(argv[i], "--no-widescreen")) set_widescreen(false);
+        else if (!strcmp(argv[i], "--widescreen")) aspect_mode = ASPECT_16_9;
+        else if (!strcmp(argv[i], "--no-widescreen")) aspect_mode = ASPECT_4_3;
+        else if (!strcmp(argv[i], "--aspect") && i + 1 < argc) {
+            ++i;
+            for (int m = 0; m < ASPECT_MODES; m++)
+                if (!strcmp(argv[i], aspect_names[m])) aspect_mode = m;
+        }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) gpu_set_scale(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--pgxp")) g_pgxp = true;
         else if (!strcmp(argv[i], "--no-pgxp")) g_pgxp = false;

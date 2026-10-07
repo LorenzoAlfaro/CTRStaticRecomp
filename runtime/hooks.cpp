@@ -1,19 +1,33 @@
 // Enhancement hooks: small register/memory patches applied at fixed instructions of the
-// game, used for the widescreen mode. The addresses must match HOOKS in gen/recomp.py.
+// game, used for the widescreen modes. The addresses must match HOOKS in gen/recomp.py.
 //
 // Widescreen follows the CTR-ModSDK 16BY9 mod: CTR renders 512x216, which the game's
-// projection assumes fills a 4:3 screen. Scaling the X row of the view-projection matrix
-// by 3/4 fits a 16:9 field of view into the same buffer (shown stretched to 16:9), the
-// culling frustum is widened by 4/3 to match, and the far-clip distance used for culling
-// is doubled as the wider frustum reaches less far.
+// projection assumes fills a 4:3 screen. Scaling the X row of the view-projection matrix by
+// k = (4/3) / aspect fits a wider field of view into the same buffer (shown stretched to the
+// target aspect), the culling frustum is widened by 1/k to match, and the far-clip distance
+// used for culling is extended as the wider frustum reaches less far (x2 at 16:9, the mod's
+// value, scaled with the width beyond that). 16:9 gives k = 750/1000 exactly as in the mod.
+#include <algorithm>
+#include <cmath>
+
 #include "recomp.h"
 #include "psx.h"
 
 int g_hooks_on = 0;
+static int32_t k_x1000 = 1000;    // projection X scale, 1/1000 units
+static int32_t far_x1000 = 1000;  // far-clip multiplier, 1/1000 units
+static double cur_aspect = 4.0 / 3.0;
 
 namespace psx {
 
-void set_widescreen(bool on) { g_hooks_on = on; }
+void set_aspect(double aspect) {
+    aspect = std::clamp(aspect, 4.0 / 3.0, 2.4);  // 4:3 .. 21:9
+    cur_aspect = aspect;
+    k_x1000 = (int32_t)std::lround(1000.0 * (4.0 / 3.0) / aspect);
+    far_x1000 = (int32_t)std::lround(2000.0 * 750.0 / k_x1000);
+    g_hooks_on = k_x1000 < 1000;
+}
+double aspect() { return cur_aspect; }
 bool widescreen() { return g_hooks_on != 0; }
 
 }  // namespace psx
@@ -24,7 +38,7 @@ enum : uint32_t {
     HOOK_FRUSTUM_FARCLIP = 0x80043280,  // PushBuffer_UpdateFrustum, t0..t2 = view dir << 8
 };
 
-static int32_t wide34(int32_t v) { return (int32_t)((int64_t)v * 750 / 1000); }
+static int32_t scale_k(int32_t v) { return (int32_t)((int64_t)v * k_x1000 / 1000); }
 
 int rt_is_hook(uint32_t pc) {
     switch (pc) {
@@ -42,17 +56,15 @@ void rt_hook(CPU* c, uint32_t pc) {
         // matrix_ViewProj at +0x28 (short m[3][3]), t[3] at +0x3C: scale row 0 and t[0]
         uint32_t pb = c->r[16];
         for (uint32_t off = 0x28; off <= 0x2C; off += 2)
-            MEM_SH(pb + off, (uint32_t)wide34((int16_t)MEM_LH(pb + off)));
-        MEM_SW(pb + 0x3C, (uint32_t)wide34((int32_t)MEM_LW(pb + 0x3C)));
+            MEM_SH(pb + off, (uint32_t)scale_k((int16_t)MEM_LH(pb + off)));
+        MEM_SW(pb + 0x3C, (uint32_t)scale_k((int32_t)MEM_LW(pb + 0x3C)));
         break;
     }
     case HOOK_FRUSTUM_WIDTH:
-        c->r[4] = (uint32_t)((int16_t)c->r[4] * 1000 / 750) & 0xFFFF;
+        c->r[4] = (uint32_t)((int16_t)c->r[4] * 1000 / k_x1000) & 0xFFFF;
         break;
     case HOOK_FRUSTUM_FARCLIP:
-        c->r[8] <<= 1;
-        c->r[9] <<= 1;
-        c->r[10] <<= 1;
+        for (int r = 8; r <= 10; r++) c->r[r] = (uint32_t)((int64_t)(int32_t)c->r[r] * far_x1000 / 1000);
         break;
     }
 }

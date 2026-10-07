@@ -22,8 +22,9 @@ for anyone writing a recompiler.
   effects and XA audio. Tested so far: the menus, single races in arcade mode, and entering
   adventure mode. Other modes, multiplayer and memory card saves (`memcard1.mcd`) have not
   been tested yet.
-* 4x internal resolution with sub-pixel vertices (no wobble) by default, optional 16:9
-  widescreen, keyboard and controller support (see below).
+* 4x internal resolution with sub-pixel vertices (no wobble) by default, optional 16:9 or
+  full-window widescreen, keyboard and controller support (see below). An Android build lives in
+  a separate project.
 * Not implemented: FMV playback (MDEC), the demo disc (`LoadExec`), the analog-pad protocol
   (analog sticks are mapped to the D-pad), more than one controller port.
 * Windows x64 only for now (`runtime/jmp.c` is Win64 assembly; everything else is portable
@@ -83,8 +84,10 @@ build.
 
 Keyboard: arrows = D-pad, C = Cross, V = Circle, X = Square, Z = Triangle, Enter = Start,
 Space = Select, LShift/RShift = L1/R1, LCtrl/RCtrl = L2/R2. F11 or Alt+Enter = fullscreen,
-Tab = fast forward, Pause = pause, F9 = 16:9 widescreen, F10 = internal resolution
+Tab = fast forward, Pause = pause, F9 = aspect (4:3 / 16:9 / fill), F10 = internal resolution
 (1x/2x/4x), F8 = PGXP sub-pixel vertices, F7 = dithering. Settings are saved in `ctr.cfg`.
+On a controller, clicking the left stick cycles the aspect and clicking the right stick cycles
+the internal resolution (the PS1 digital pad has no stick buttons, so the game never sees them).
 
 Game controllers with an SDL mapping (Xbox/XInput, DualShock 4/DualSense, most common pads)
 use the standard layout (A = Cross, B = Circle, X = Square, Y = Triangle). Joysticks without a
@@ -121,13 +124,20 @@ Performance on a Ryzen 5 3600 during a race: about 8 ms per frame at 4x (well wi
 
 ## Widescreen
 
-`--widescreen` or F9 switches to 16:9. It works like the CTR-ModSDK 16BY9 mod: the X row of the
-camera's view-projection matrix is scaled by 3/4 so a wider field of view fits in the game's
-512x216 buffer, which is then shown stretched to 16:9. The culling frustum and far-clip
-distance are widened to match, so nothing pops in at the new edges. These patches are runtime
-hooks on three instructions in `PushBuffer_SetMatrixVP` / `PushBuffer_UpdateFrustum`
-(`runtime/hooks.cpp`, `HOOKS` in `gen/recomp.py`). 2D elements (HUD, menus, text) are not
-corrected and appear 33% wider.
+Three aspect modes, cycled with F9 or a left-stick click (`--aspect 4:3|16:9|fill`):
+
+* **4:3**: the original picture.
+* **16:9**: like the CTR-ModSDK 16BY9 mod.
+* **fill**: widescreen at the window's or screen's own aspect ratio, up to 21:9. This is the
+  default on Android, where a 20:9 phone is filled edge to edge.
+
+Widescreen scales the X row of the camera's view-projection matrix by (4/3) / aspect (3/4 at
+16:9), so a wider field of view fits in the game's 512x216 buffer, which is then shown
+stretched to the target aspect. The culling frustum and far-clip distance are widened to
+match, so nothing pops in at the new edges. These patches are runtime hooks on three
+instructions in `PushBuffer_SetMatrixVP` / `PushBuffer_UpdateFrustum` (`runtime/hooks.cpp`,
+`HOOKS` in `gen/recomp.py`). 2D elements (HUD, menus, text) are not corrected and appear wider:
+33% at 16:9, 67% at 20:9.
 
 ## Debugging tools
 
