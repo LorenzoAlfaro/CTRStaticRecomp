@@ -237,6 +237,33 @@ frontend. An interpreter runs code that cannot be recompiled safely.
   without PGXP. Native resolution hides sub-pixel gaps that upscaling exposes; most upscaling
   renderers show the same thing.
 
+### Android port (`CTRStaticRecompAndroid`)
+The recompiled C and the runtime ported with few changes; it ran at 60 fps at 2x on a Pixel 7a
+on the first successful launch. The hiccups were all in packaging and the device, not the
+recompilation.
+
+| # | Blocker | Time | Status |
+|---|---|---|---|
+| A1 | App could not read the disc copied into its folder | 1 | Solved |
+| A2 | App paused on launch: phone locked with the screen off | 1 | Solved |
+| A3 | Accelerometer exposed as a joystick (tilt = D-pad presses) | 1 | Solved |
+
+- **What had to change:**
+  - `rt_setjmp/longjmp` for AArch64 (x19–x30, sp, d8–d15, fpcr);
+  - an ARM `yield` instead of x86 `_mm_pause`;
+  - an Android startup block (working directory, log, disc search, fullscreen landscape).
+- **Thread stack:** SDL's Java thread stack was enlarged to 64 MB as a precaution against deep
+  recursion in recompiled code.
+- **A1:** `adb shell mkdir` created `Android/data/<package>/files` owned by `shell`, so the app
+  could list the files but not open the disc. Let the app create its own folder first (launch
+  it once), then copy files in.
+- **A2:** check `dumpsys power` (`mWakefulness`) and `isKeyguardShowing` when an app pauses
+  immediately after `onResume`.
+- **A3:** set `SDL_HINT_ACCELEROMETER_AS_JOYSTICK=0`, or tilting the phone feeds stick input.
+- **Lesson:** keep the runtime free of platform assumptions, and keep host-ABI assembly in one
+  file. Building the APK with the SDK tools directly (aapt2, d8, zipalign, apksigner) avoided all
+  Gradle/AGP version problems.
+
 ### Open issues
 - MDEC (FMV decoding) is a stub; `LoadExec` (demo discs) is not implemented.
 - Only the digital pad is emulated (analog sticks are mapped to the D-pad).
