@@ -52,6 +52,7 @@ static int h_start = 0x200, h_end = 0xC00, v_start = 0x10, v_end = 0x100;
 static uint32_t disp_mode = 0;
 static bool irq_flag = false;
 static bool vblank_now = false;
+uint64_t g_gpu_flips = 0;  // display buffer changes (GP1(05)), i.e. frames the game showed
 
 // command FIFO
 static uint32_t cmd[64];
@@ -922,7 +923,10 @@ void gpu_write_gp1(uint32_t v) {
     case 0x02: irq_flag = false; break;
     case 0x03: display_disabled = v & 1; break;
     case 0x04: dma_dir = v & 3; break;
-    case 0x05: disp_x = v & 0x3FE; disp_y = (v >> 10) & 0x1FF; break;
+    case 0x05:
+        if ((int)(v & 0x3FE) != disp_x || (int)((v >> 10) & 0x1FF) != disp_y) g_gpu_flips++;  // game frame shown
+        disp_x = v & 0x3FE; disp_y = (v >> 10) & 0x1FF;
+        break;
     case 0x06: h_start = v & 0xFFF; h_end = (v >> 12) & 0xFFF; break;
     case 0x07: v_start = v & 0x3FF; v_end = (v >> 10) & 0x3FF; break;
     case 0x08: disp_mode = v & 0xFF; break;

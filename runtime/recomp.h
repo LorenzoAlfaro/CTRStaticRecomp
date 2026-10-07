@@ -15,6 +15,7 @@ typedef struct CPU {
     uint32_t cop0[32];
     uint32_t gte_data[32];
     uint32_t gte_ctrl[32];
+    uint32_t cyc_frac;    // fractional cycles (1/256) when the CPU is overclocked
 } CPU;
 
 typedef void (*RecompFunc)(CPU* c);
@@ -159,7 +160,19 @@ static inline void DIVU(CPU* c, uint32_t n, uint32_t d) {
 
 // ---- control flow / events ---------------------------------------------------
 void rt_check_events(CPU* c);
-#define CYC(n) (c->cycles += (n))
+// Emulated cycles charged per instruction, in 1/256 units: 256 = stock 33.87 MHz, 128 = the
+// CPU runs twice as fast relative to the rest of the hardware (overclock, see hooks.cpp).
+extern uint32_t g_cyc_scale;
+static inline void rt_cyc(CPU* c, uint32_t n) {
+    if (g_cyc_scale == 256) {
+        c->cycles += n;
+    } else {
+        uint32_t t = c->cyc_frac + n * g_cyc_scale;
+        c->cycles += t >> 8;
+        c->cyc_frac = t & 255;
+    }
+}
+#define CYC(n) rt_cyc(c, (n))
 #define CHECK_EVENTS(c) do { if ((c)->cycles >= (c)->next_event) rt_check_events(c); } while (0)
 
 #ifdef RECOMP_RET_CHECK

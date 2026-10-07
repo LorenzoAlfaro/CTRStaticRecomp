@@ -130,15 +130,21 @@ enum { ASPECT_4_3, ASPECT_16_9, ASPECT_FILL, ASPECT_MODES };
 static int aspect_mode = ASPECT_4_3;
 static const char* aspect_names[ASPECT_MODES] = {"4:3", "16:9", "fill"};
 
+static double fill_override = 0;  // --aspect W:H: "fill" uses this ratio instead of the window's
+static int overclock_setting = 0;  // CPU overclock %, 0 = auto (200% in widescreen, else stock)
+
 static void apply_aspect() {
     double a = 4.0 / 3.0;
     if (aspect_mode == ASPECT_16_9) a = 16.0 / 9.0;
-    if (aspect_mode == ASPECT_FILL && renderer) {
+    if (aspect_mode == ASPECT_FILL && fill_override > 0) a = fill_override;
+    else if (aspect_mode == ASPECT_FILL && renderer) {
         int ww = 0, wh = 0;
         SDL_GetRendererOutputSize(renderer, &ww, &wh);
         if (ww > 0 && wh > 0) a = (double)ww / wh;
     }
     if (a != aspect()) set_aspect(a);
+    int oc = overclock_setting ? overclock_setting : (widescreen() ? 200 : 100);
+    if (oc != overclock()) set_overclock(oc);
 }
 
 // persistent user settings (ctr.cfg next to the game)
@@ -150,6 +156,7 @@ static void load_settings() {
         int v;
         if (sscanf(line, "widescreen=%d", &v) == 1) aspect_mode = v ? ASPECT_16_9 : ASPECT_4_3;  // older ctr.cfg
         if (sscanf(line, "aspect=%d", &v) == 1 && v >= 0 && v < ASPECT_MODES) aspect_mode = v;
+        if (sscanf(line, "overclock=%d", &v) == 1) overclock_setting = v;
         if (sscanf(line, "scale=%d", &v) == 1) gpu_set_scale(v);
         if (sscanf(line, "pgxp=%d", &v) == 1) g_pgxp = v != 0;
         if (sscanf(line, "dither=%d", &v) == 1) gpu_set_dither(v != 0);
@@ -161,6 +168,7 @@ static void save_settings() {
     FILE* f = fopen("ctr.cfg", "w");
     if (!f) return;
     fprintf(f, "aspect=%d\n", aspect_mode);
+    fprintf(f, "overclock=%d\n", overclock_setting);
     fprintf(f, "scale=%d\n", gpu_scale());
     fprintf(f, "pgxp=%d\n", g_pgxp ? 1 : 0);
     fprintf(f, "dither=%d\n", gpu_dither() ? 1 : 0);
@@ -400,6 +408,10 @@ void frontend_vblank() {
             memset(g_gpu_stall_why, 0, sizeof g_gpu_stall_why);
             LOGI("profile: gpu sync wait %.2f ms/frame (incl. vblank), queue full %.2f ms/frame, vram copies %.1f/frame",
                  g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
+            // the game's own frame rate: display buffer flips per 300 vblanks (emulated time)
+            static uint64_t flips_last = 0;
+            LOGI("profile: game renders %.1f fps (CPU %d%%)", (g_gpu_flips - flips_last) * 59.826 / 300, overclock());
+            flips_last = g_gpu_flips;
             g_gpu_wait_s = g_gpu_full_s = 0;
             g_gpu_copies = 0;
             p_last = t3; p_sync = p_conv = p_present = 0; g_gpu_stalls = 0;
@@ -441,9 +453,9 @@ void frontend_vblank() {
     if (fps_t == 0) fps_t = t;
     if (t - fps_t >= 1.0) {
         char title[128];
-        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps - %s (%.2f:1) - %dx%s",
+        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps - %s (%.2f:1) - %dx%s - CPU %d%%",
                  (frame_counter - fps_n) / (t - fps_t), aspect_names[aspect_mode], aspect(), gpu_scale(),
-                 g_pgxp ? " PGXP" : "");
+                 g_pgxp ? " PGXP" : "", overclock());
         SDL_SetWindowTitle(window, title);
 #ifdef __ANDROID__
         // no window title on a phone: log it now and then
@@ -530,10 +542,16 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--widescreen")) aspect_mode = ASPECT_16_9;
         else if (!strcmp(argv[i], "--no-widescreen")) aspect_mode = ASPECT_4_3;
+        else if (!strcmp(argv[i], "--overclock") && i + 1 < argc) overclock_setting = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--aspect") && i + 1 < argc) {
             ++i;
             for (int m = 0; m < ASPECT_MODES; m++)
                 if (!strcmp(argv[i], aspect_names[m])) aspect_mode = m;
+            int w = 0, h = 0;
+            if (sscanf(argv[i], "%d:%d", &w, &h) == 2 && w > 0 && h > 0 && strcmp(argv[i], "4:3") && strcmp(argv[i], "16:9")) {
+                aspect_mode = ASPECT_FILL;  // any other ratio, e.g. 20:9 (for testing phone shapes)
+                fill_override = (double)w / h;
+            }
         }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) gpu_set_scale(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--pgxp")) g_pgxp = true;

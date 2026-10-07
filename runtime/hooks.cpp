@@ -14,6 +14,7 @@
 #include "psx.h"
 
 int g_hooks_on = 0;
+uint32_t g_cyc_scale = 256;
 static int32_t k_x1000 = 1000;    // projection X scale, 1/1000 units
 static int32_t far_x1000 = 1000;  // far-clip multiplier, 1/1000 units
 static double cur_aspect = 4.0 / 3.0;
@@ -29,6 +30,16 @@ void set_aspect(double aspect) {
 }
 double aspect() { return cur_aspect; }
 bool widescreen() { return g_hooks_on != 0; }
+
+// CPU overclock: a wider view makes the game draw more, which overruns the PS1's frame budget
+// and slows the game down (on real hardware too). Running the CPU faster relative to the rest
+// of the hardware keeps the game at full speed.
+static int overclock_pct = 100;
+void set_overclock(int percent) {
+    overclock_pct = std::clamp(percent, 100, 400);
+    g_cyc_scale = (uint32_t)(256 * 100 / overclock_pct);
+}
+int overclock() { return overclock_pct; }
 
 }  // namespace psx
 

@@ -85,6 +85,7 @@ DisplayInfo gpu_display();
 const uint16_t* gpu_vram();  // internal resolution: (1024*scale) x (512*scale)
 uint16_t gpu_vram_native(int x, int y);
 void gpu_sync();  // finish queued rendering before reading VRAM
+extern uint64_t g_gpu_flips;
 void gpu_convert_display(uint32_t* dst, int pitch_px, int x, int y, int w, int h);
 int gpu_scale();
 void gpu_set_scale(int scale);  // 1, 2, 4 or 8 (rounded down to a power of two)
@@ -95,6 +96,8 @@ bool gpu_dither();
 void set_aspect(double aspect);  // displayed aspect ratio; 4/3 = original, wider = widescreen hooks
 double aspect();
 bool widescreen();
+void set_overclock(int percent);  // emulated CPU speed, 100 = stock .. 400
+int overclock();
 
 // ---- SPU ---------------------------------------------------------------------------
 void spu_init();

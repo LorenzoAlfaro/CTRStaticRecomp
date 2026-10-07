@@ -160,7 +160,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
     auto exec_delay = [&](uint32_t at) {
         uint32_t dw = MEM_LW(at + 4);
         c->pc = at + 4;
-        c->cycles += insn_cycles(dw);
+        rt_cyc(c, insn_cycles(dw));
         interp_exec_simple(c, dw, at + 4);
     };
     // transfer control to t as a call (link) or jump; returns next pc to interpret
@@ -190,7 +190,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
         uint32_t w = MEM_LW(pc);
         uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31, rd = (w >> 11) & 31;
         uint32_t simm = (uint32_t)(int32_t)(int16_t)(w & 0xFFFF);
-        c->cycles += insn_cycles(w);
+        rt_cyc(c, insn_cycles(w));
         c->pc = pc;
         if (op == 0 && ((w & 63) == 0x08 || (w & 63) == 0x09)) {  // jr / jalr
             uint32_t t = r[rs];
@@ -660,7 +660,7 @@ int rt_unwind_call(CPU* c, uint32_t target, uint32_t ret) {
 }
 
 void rt_ThTick_SetAndExec(CPU* c) {
-    c->cycles += 10;                // the 6 MIPS instructions this replaces (lockstep timing)
+    rt_cyc(c, 10);                  // the 6 MIPS instructions this replaces (lockstep timing)
     MEM_SW(c->r[4] + 44, c->r[5]);  // t->funcThTick = a1
     if (g_unwind_depth == 0) {
         LOGW("ThTick_SetAndExec outside ThTick_RunBucket");

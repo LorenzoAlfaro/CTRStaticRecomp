@@ -139,6 +139,12 @@ instructions in `PushBuffer_SetMatrixVP` / `PushBuffer_UpdateFrustum` (`runtime/
 `HOOKS` in `gen/recomp.py`). 2D elements (HUD, menus, text) are not corrected and appear wider:
 33% at 16:9, 67% at 20:9.
 
+A wider view makes the game draw more, which slightly overruns the PS1's frame budget: in races
+at 20:9 the game dropped from 30 to about 28.7 fps in heavy sections, and loading took longer.
+Widescreen therefore runs the emulated CPU at 200% by default, which keeps it at a steady 30
+fps. `--overclock 100..400` (or `overclock=` in `ctr.cfg`; 0 = auto) sets it explicitly. At
+4:3 the CPU runs at stock speed and the output is unchanged.
+
 ## Debugging tools
 
 * `--frames N`, `--shot N file.bmp`, `--shot-every N dir`, `--turbo`, `--keys` (scripted

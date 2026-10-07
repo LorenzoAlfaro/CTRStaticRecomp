@@ -247,6 +247,7 @@ recompilation.
 | A1 | App could not read the disc copied into its folder | 1 | Solved |
 | A2 | App paused on launch: phone locked with the screen off | 1 | Solved |
 | A3 | Accelerometer exposed as a joystick (tilt = D-pad presses) | 1 | Solved |
+| A4 | Misread a widescreen "slowdown" (compared race clocks at a fixed frame) | 1 | Solved (overclock) |
 
 - **What had to change:**
   - `rt_setjmp/longjmp` for AArch64 (x19–x30, sp, d8–d15, fpcr);
@@ -260,6 +261,18 @@ recompilation.
 - **A2:** check `dumpsys power` (`mWakefulness`) and `isKeyguardShowing` when an app pauses
   immediately after `onResume`.
 - **A3:** set `SDL_HINT_ACCELEROMETER_AS_JOYSTICK=0`, or tilting the phone feeds stick input.
+- **A4:** at 20:9 the race clock at frame 4500 read 1.90 s versus 2.87 s at 4:3. That looked
+  like slow motion, but it was mostly longer *loading* in widescreen. In-race the clock advanced
+  9.95 s per 10 s at every aspect.
+  - **Better measure:** count display-buffer flips (GP1(05)) per second. That showed 30 fps
+    dropping to about 28.7 in heavy sections at 20:9.
+  - **Fix:** a 200% CPU overclock in widescreen, applied as a fractional cycle scale in `CYC`;
+    at 100% the behaviour is bit-identical.
+  - **Lesson:** measure the quantity you mean (frame rate, or clock advance over a fixed window),
+    not a value at a fixed frame index after variable-length loading.
+- **Testing on the device:** `--keys` and other options go through the launch intent
+  (`am start -e args '...'`). Quote the whole command for `adb shell`, or the device shell splits
+  the value at the first space.
 - **Lesson:** keep the runtime free of platform assumptions, and keep host-ABI assembly in one
   file. Building the APK with the SDK tools directly (aapt2, d8, zipalign, apksigner) avoided all
   Gradle/AGP version problems.
