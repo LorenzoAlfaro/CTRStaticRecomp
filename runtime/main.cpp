@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
@@ -404,6 +405,11 @@ void frontend_vblank() {
         snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps%s - %dx%s", (frame_counter - fps_n) / (t - fps_t),
                  widescreen() ? " - 16:9" : "", gpu_scale(), g_pgxp ? " PGXP" : "");
         SDL_SetWindowTitle(window, title);
+#ifdef __ANDROID__
+        // no window title on a phone: log it now and then
+        static int fps_log = 0;
+        if (++fps_log % 10 == 0) LOGI("%s", title + strlen("Crash Team Racing (static recomp) - "));
+#endif
         fps_t = t;
         fps_n = frame_counter;
     }
@@ -431,6 +437,14 @@ static std::string find_disc(int argc, char** argv) {
         }
         fclose(f);
     }
+    // otherwise the first .cue (or .bin) in the working directory
+    std::error_code ec;
+    for (const char* ext : {".cue", ".bin"})
+        for (const auto& e : std::filesystem::directory_iterator(".", ec)) {
+            std::string ex = e.path().extension().string();
+            for (char& ch : ex) ch = (char)tolower((unsigned char)ch);
+            if (e.is_regular_file(ec) && ex == ext) return e.path().filename().string();
+        }
     return "";
 }
 
@@ -443,13 +457,32 @@ int main(int argc, char** argv) {
     // GUI build: no console, so keep the log in a file next to the game
     if (_fileno(stderr) < 0) freopen("ctr.log", "w", stderr);
 #endif
+#ifdef __ANDROID__
+    // everything lives in the app's external files directory
+    // (/sdcard/Android/data/<package>/files): disc image, ctr.cfg, memory cards, ctr.log
+    if (const char* dir = SDL_AndroidGetExternalStoragePath()) {
+        std::error_code ec;
+        std::filesystem::current_path(dir, ec);
+    }
+    freopen("ctr.log", "w", stderr);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+#endif
     std::string disc = find_disc(argc, argv);
     if (disc.empty()) {
         fprintf(stderr, "usage: %s <CTR (USA).cue|.bin>\n  (or put the path in ctr_disc.txt)\n", argv[0]);
+#ifdef __ANDROID__
+        std::string msg = "Copy the CTR (USA) .cue and .bin into\n" + std::filesystem::current_path().string();
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Disc image not found", msg.c_str(), nullptr);
+#endif
         return 1;
     }
-    // defaults: 4x internal resolution with sub-pixel vertices (ctr.cfg / options override)
+    // defaults: 4x internal resolution with sub-pixel vertices, 2x on phones (ctr.cfg and
+    // options override)
+#ifdef __ANDROID__
+    gpu_set_scale(2);
+#else
     gpu_set_scale(4);
+#endif
     g_pgxp = true;
     load_settings();
     for (int i = 1; i < argc; i++) {
@@ -495,12 +528,20 @@ int main(int argc, char** argv) {
 
     // controllers keep working when the window is not focused
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // phones: don't expose the accelerometer as a joystick (tilting would press the D-pad)
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    window = SDL_CreateWindow("Crash Team Racing (static recomp)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                              1280, 960, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI);
+#else
     window = SDL_CreateWindow("Crash Team Racing (static recomp)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               1280, 960, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#endif
     SDL_RaiseWindow(window);
     SDL_SetWindowInputFocus(window);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);

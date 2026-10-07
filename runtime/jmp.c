@@ -1,10 +1,11 @@
 // Minimal setjmp/longjmp for the runtime's non-local control flow (interrupt return,
 // CTR thread unwinding, multi-level returns). Unlike __builtin_setjmp, this saves and
-// restores every callee-saved register of the Win64 ABI, including XMM6-XMM15, so
-// compiled code that keeps values in those registers across calls stays correct.
+// restores every callee-saved register of the host ABI (Win64: including XMM6-XMM15;
+// AArch64: including d8-d15), so compiled code that keeps values in those registers
+// across calls stays correct.
 // No SEH unwinding is performed (the skipped frames have nothing to clean up).
 //
-// Buffer layout (see rt_jmp_buf in recomp.h), offsets in bytes:
+// Win64 buffer layout (see rt_jmp_buf in recomp.h), offsets in bytes:
 //   0 rbx, 8 rbp, 16 rdi, 24 rsi, 32 r12, 40 r13, 48 r14, 56 r15, 64 rsp, 72 rip,
 //   80 mxcsr/fpcw, 96..255 xmm6..xmm15
 #if defined(_WIN64) && defined(__x86_64__)
@@ -69,6 +70,54 @@ __asm__(
     "    movdqu 240(%rcx), %xmm15\n"
     "    movq 64(%rcx), %rsp\n"
     "    jmpq *72(%rcx)\n");
+#elif defined(__aarch64__) && defined(__ELF__)
+// AArch64 (Linux / Android). Callee-saved per AAPCS64: x19-x28, x29 (fp), x30 (lr), sp,
+// and the low 64 bits of v8-v15 (d8-d15). x18 is the platform register (Android's shadow
+// call stack) and is left alone. Buffer layout, offsets in bytes:
+//   0 x19..x28, 80 x29, 88 x30, 96 sp, 112 d8..d15, 176 fpcr
+__asm__(
+    ".text\n"
+    ".globl rt_setjmp\n"
+    ".type rt_setjmp, %function\n"
+    "rt_setjmp:\n"
+    "    stp x19, x20, [x0, #0]\n"
+    "    stp x21, x22, [x0, #16]\n"
+    "    stp x23, x24, [x0, #32]\n"
+    "    stp x25, x26, [x0, #48]\n"
+    "    stp x27, x28, [x0, #64]\n"
+    "    stp x29, x30, [x0, #80]\n"
+    "    mov x2, sp\n"
+    "    str x2, [x0, #96]\n"
+    "    stp d8, d9, [x0, #112]\n"
+    "    stp d10, d11, [x0, #128]\n"
+    "    stp d12, d13, [x0, #144]\n"
+    "    stp d14, d15, [x0, #160]\n"
+    "    mrs x2, fpcr\n"
+    "    str x2, [x0, #176]\n"
+    "    mov w0, #0\n"
+    "    ret\n"
+    ".size rt_setjmp, .-rt_setjmp\n"
+    ".globl rt_longjmp\n"
+    ".type rt_longjmp, %function\n"
+    "rt_longjmp:\n"
+    "    ldp x19, x20, [x0, #0]\n"
+    "    ldp x21, x22, [x0, #16]\n"
+    "    ldp x23, x24, [x0, #32]\n"
+    "    ldp x25, x26, [x0, #48]\n"
+    "    ldp x27, x28, [x0, #64]\n"
+    "    ldp x29, x30, [x0, #80]\n"
+    "    ldr x2, [x0, #96]\n"
+    "    mov sp, x2\n"
+    "    ldp d8, d9, [x0, #112]\n"
+    "    ldp d10, d11, [x0, #128]\n"
+    "    ldp d12, d13, [x0, #144]\n"
+    "    ldp d14, d15, [x0, #160]\n"
+    "    ldr x2, [x0, #176]\n"
+    "    msr fpcr, x2\n"
+    "    cmp w1, #0\n"
+    "    csinc w0, w1, wzr, ne\n"  // return val, or 1 if val == 0
+    "    br x30\n"
+    ".size rt_longjmp, .-rt_longjmp\n");
 #else
-#error "rt_setjmp/rt_longjmp are implemented for Windows x86-64 only"
+#error "rt_setjmp/rt_longjmp are implemented for Windows x86-64 and AArch64 ELF only"
 #endif

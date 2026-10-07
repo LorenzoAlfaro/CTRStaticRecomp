@@ -19,7 +19,7 @@ typedef struct CPU {
 
 typedef void (*RecompFunc)(CPU* c);
 
-// setjmp/longjmp that preserve all Win64 callee-saved registers incl. XMM6-15 (jmp.c)
+// setjmp/longjmp that preserve all callee-saved registers of the host ABI (jmp.c)
 typedef uint64_t rt_jmp_buf[32];
 int rt_setjmp(uint64_t* buf) __attribute__((returns_twice));
 __attribute__((noreturn)) void rt_longjmp(uint64_t* buf, int val);
