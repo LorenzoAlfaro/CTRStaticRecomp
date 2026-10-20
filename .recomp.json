@@ -1,0 +1,14 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Crash Team Racing",
+  "wikidata": "Q834872",
+  "system": "PS1",
+  "type": "recomp",
+  "original": {"region": "USA", "serial": "SCUS-94426"},
+  "project": "CTRStaticRecomp",
+  "status": "in-progress",
+  "targets": ["Windows"],
+  "toolchain": "custom",
+  "approach": "MIPS R3000A code translated to C at build time and linked with an HLE PS1 runtime (GTE, software GPU, SPU, CD-ROM); hand-written render asm runs on an interpreter.",
+  "notes": "Menus and races play at full speed with music and XA audio. 4x internal resolution with sub-pixel vertices, 16:9 or full-window widescreen. Not yet: FMV (MDEC), analog pad, multiplayer beyond one controller."
+}
