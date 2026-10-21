@@ -118,6 +118,44 @@ __asm__(
     "    csinc w0, w1, wzr, ne\n"  // return val, or 1 if val == 0
     "    br x30\n"
     ".size rt_longjmp, .-rt_longjmp\n");
+#elif defined(__arm__) && defined(__ELF__)
+// 32-bit ARM (armeabi-v7a, e.g. Android TVs). Callee-saved per AAPCS: r4-r11, sp, lr, and
+// VFP d8-d15 (armeabi-v7a always has VFPv3-D16 or better). Assembled in ARM mode; callers
+// in Thumb reach it through the linker's interworking (bl -> blx), and `bx` returns to either
+// mode. Buffer layout, offsets in bytes:
+//   0 r4..r11, 32 sp, 36 lr, 48 d8..d15, 112 fpscr
+__asm__(
+    ".text\n"
+    ".syntax unified\n"
+    ".arm\n"
+    ".align 2\n"
+    ".globl rt_setjmp\n"
+    ".type rt_setjmp, %function\n"
+    "rt_setjmp:\n"
+    "    stmia r0, {r4-r11}\n"
+    "    str sp, [r0, #32]\n"
+    "    str lr, [r0, #36]\n"
+    "    add r1, r0, #48\n"
+    "    vstmia r1, {d8-d15}\n"
+    "    vmrs r2, fpscr\n"
+    "    str r2, [r0, #112]\n"
+    "    mov r0, #0\n"
+    "    bx lr\n"
+    ".size rt_setjmp, .-rt_setjmp\n"
+    ".globl rt_longjmp\n"
+    ".type rt_longjmp, %function\n"
+    "rt_longjmp:\n"
+    "    ldmia r0, {r4-r11}\n"
+    "    ldr sp, [r0, #32]\n"
+    "    ldr lr, [r0, #36]\n"
+    "    add r2, r0, #48\n"
+    "    vldmia r2, {d8-d15}\n"
+    "    ldr r2, [r0, #112]\n"
+    "    vmsr fpscr, r2\n"
+    "    movs r0, r1\n"
+    "    moveq r0, #1\n"  // return val, or 1 if val == 0
+    "    bx lr\n"
+    ".size rt_longjmp, .-rt_longjmp\n");
 #else
-#error "rt_setjmp/rt_longjmp are implemented for Windows x86-64 and AArch64 ELF only"
+#error "rt_setjmp/rt_longjmp are implemented for Windows x86-64, AArch64 and ARMv7 ELF only"
 #endif

@@ -248,6 +248,7 @@ recompilation.
 | A2 | App paused on launch: phone locked with the screen off | 1 | Solved |
 | A3 | Accelerometer exposed as a joystick (tilt = D-pad presses) | 1 | Solved |
 | A4 | Misread a widescreen "slowdown" (compared race clocks at a fixed frame) | 1 | Solved (overclock) |
+| A5 | Android TV (Sony BRAVIA BF1): 32-bit only userland, ~3x too slow | 3 | In progress |
 
 - **What had to change:**
   - `rt_setjmp/longjmp` for AArch64 (x19–x30, sp, d8–d15, fpcr);
@@ -270,6 +271,19 @@ recompilation.
     at 100% the behaviour is bit-identical.
   - **Lesson:** measure the quantity you mean (frame rate, or clock advance over a fixed window),
     not a value at a fixed frame index after variable-length loading.
+- **A5:** many Android TVs run a 32-bit Android (`armeabi-v7a`) even on 64-bit chips. The
+  BRAVIA BF1 has a MediaTek MT9687 with 4x Cortex-A55 and 2.4 GB RAM. Supporting it needed:
+  - an ARMv7 `rt_setjmp/longjmp` (r4–r11, sp, lr, d8–d15, fpscr);
+  - a two-ABI APK;
+  - a leanback launcher entry plus a banner, since TV launchers ignore apps without them.
+
+  It ran at about 48 ms per frame (60 fps needs 16.7). simpleperf (app marked
+  `<profileable android:shell="true"/>`) showed the time split between:
+  - the MIPS interpreter running CTR's render asm (30% of the emulation thread);
+  - waiting for the 2 render threads at 2x (33%);
+  - a per-instruction widescreen hook call (3.5%).
+
+  Check a device's ABI (`getprop ro.product.cpu.abilist`) before planning a port.
 - **Testing on the device:** `--keys` and other options go through the launch intent
   (`am start -e args '...'`). Quote the whole command for `adb shell`, or the device shell splits
   the value at the first space.

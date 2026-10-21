@@ -354,7 +354,7 @@ void frontend_poll_input() {
 
 extern uint64_t g_gpu_stalls, g_gpu_stall_why[4], g_gpu_copies;
 extern double g_gpu_wait_s, g_gpu_full_s;
-static bool profile = getenv("CTR_PROFILE") != nullptr;
+static bool profile = getenv("CTR_PROFILE") != nullptr;  // or --profile
 
 void frontend_vblank() {
     frame_counter++;
@@ -540,6 +540,7 @@ int main(int argc, char** argv) {
     load_settings();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
+        else if (!strcmp(argv[i], "--profile")) profile = true;
         else if (!strcmp(argv[i], "--widescreen")) aspect_mode = ASPECT_16_9;
         else if (!strcmp(argv[i], "--no-widescreen")) aspect_mode = ASPECT_4_3;
         else if (!strcmp(argv[i], "--overclock") && i + 1 < argc) overclock_setting = atoi(argv[++i]);

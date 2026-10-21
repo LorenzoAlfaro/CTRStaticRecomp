@@ -142,7 +142,7 @@ static void count_miss(uint32_t addr) {
 
 void rt_nonlocal_return_check(uint32_t target);
 
-void interp_exec_simple(CPU* c, uint32_t w, uint32_t pc);
+static inline __attribute__((always_inline)) void interp_exec_simple(CPU* c, uint32_t w, uint32_t pc);
 
 static inline bool is_func_entry(uint32_t t) {
     t = canon(t);
@@ -186,7 +186,8 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
             if (depth == 0) return;
             depth--;
         }
-        if (g_hooks_on && rt_is_hook(canon(pc))) rt_hook(c, canon(pc));
+        // hook addresses (hooks.cpp) all lie in PushBuffer_SetMatrixVP..UpdateFrustum: cheap range test first
+        if (g_hooks_on && pc - 0x80042E34u <= 0x80043280u - 0x80042E34u && rt_is_hook(pc)) rt_hook(c, pc);
         uint32_t w = MEM_LW(pc);
         uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31, rd = (w >> 11) & 31;
         uint32_t simm = (uint32_t)(int32_t)(int16_t)(w & 0xFFFF);
@@ -242,7 +243,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
     }
 }
 
-void interp_exec_simple(CPU* c, uint32_t w, uint32_t pc) {
+static inline __attribute__((always_inline)) void interp_exec_simple(CPU* c, uint32_t w, uint32_t pc) {
     uint32_t* r = c->r;
     uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31, rd = (w >> 11) & 31;
     uint32_t sa = (w >> 6) & 31, imm = w & 0xFFFF;

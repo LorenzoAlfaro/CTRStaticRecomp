@@ -25,7 +25,7 @@ namespace psx {
 static inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || (defined(__arm__) && __ARM_ARCH >= 7)
     __asm__ volatile("yield");
 #endif
 }
@@ -419,7 +419,7 @@ static std::atomic<bool> workers_quit{false};
 static std::mutex q_mutex;
 static std::condition_variable q_cv;
 static std::atomic<int> q_sleepers{0};
-static bool threaded = false;  // queue in use (scale > 1 and workers available)
+static bool threaded = false;  // queue in use (worker threads available)
 
 // Hazard tracking between the emulation thread and the workers: VRAM areas written and read
 // by queued jobs since the last sync, in 16x8 native-pixel tiles (8 rows, so a framebuffer
@@ -1037,7 +1037,7 @@ void gpu_set_scale(int scale) {
     int nsh = 0;
     while (nsh < 3 && (2 << nsh) <= scale) nsh++;
     gpu_sync();
-    threaded = nsh > 0;
+    threaded = std::thread::hardware_concurrency() >= 2;  // worker threads at every scale
     if (threaded && !workers) start_workers();
     if (nsh == sh) return;
     // resample the current contents so a change while running keeps the picture
