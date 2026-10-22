@@ -57,6 +57,8 @@ void mem_write32_slow(uint32_t a, uint32_t v);
 #define PHYS(a) ((a) & 0x1FFFFFFFu)
 #define IS_RAM(p) ((p) < 0x00800000u)
 #define IS_SCRATCH(p) (((p) & 0xFFFFFC00u) == 0x1F800000u)
+// plain memory (RAM or scratchpad): accesses that cannot observe the cycle counter
+#define FLAT_FAST(a) (IS_RAM(PHYS(a)) || IS_SCRATCH(PHYS(a)))
 
 extern uint32_t g_watch_value, g_watch_addr;  // debug store watchpoints (RECOMP_CHECK_CALLS builds)
 #ifdef RECOMP_CHECK_CALLS

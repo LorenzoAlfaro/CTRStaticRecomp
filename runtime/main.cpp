@@ -2,11 +2,13 @@
 #include <SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "pgxp.h"
@@ -352,6 +354,34 @@ void frontend_poll_input() {
     update_pad();
 }
 
+// --pc-sample A B: a background thread samples the emulated pc about every millisecond during
+// frames A..B and prints the hottest addresses at exit (accurate with --interp, where every
+// instruction updates c->pc; recompiled code does not)
+static uint64_t pc_sample_from = 0, pc_sample_to = 0;
+static std::atomic<bool> pc_sample_stop{false};
+static std::unordered_map<uint32_t, uint64_t> pc_samples;
+static void pc_sampler_start() {
+    if (!pc_sample_to) return;
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            uint64_t f = frame_counter;
+            if (pc_sample_stop) return;
+            if (f >= pc_sample_from && f < pc_sample_to) pc_samples[g_cpu.pc]++;
+        }
+    }).detach();
+}
+static void pc_sampler_report() {
+    if (!pc_sample_to) return;
+    std::vector<std::pair<uint64_t, uint32_t>> v;
+    uint64_t total = 0;
+    for (auto& [pc, n] : pc_samples) { v.push_back({n, pc}); total += n; }
+    std::sort(v.rbegin(), v.rend());
+    LOGI("pc samples (%llu total), hottest:", (unsigned long long)total);
+    for (size_t i = 0; i < v.size() && i < 40; i++)
+        LOGI("  %08x  %5.2f%%", v[i].second, 100.0 * v[i].first / std::max<uint64_t>(total, 1));
+}
+
 extern uint64_t g_gpu_stalls, g_gpu_stall_why[4], g_gpu_copies;
 extern double g_gpu_wait_s, g_gpu_full_s;
 static bool profile = getenv("CTR_PROFILE") != nullptr;  // or --profile
@@ -428,6 +458,7 @@ void frontend_vblank() {
     do {
         frontend_poll_input();
         if (g_quit) {
+            pc_sampler_report();
             bios_flush_cards();
             SDL_Quit();
             fflush(stderr);
@@ -541,6 +572,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--profile")) profile = true;
+        else if (!strcmp(argv[i], "--pc-sample") && i + 2 < argc) {
+            pc_sample_from = strtoull(argv[++i], nullptr, 10);
+            pc_sample_to = strtoull(argv[++i], nullptr, 10);
+        }
         else if (!strcmp(argv[i], "--widescreen")) aspect_mode = ASPECT_16_9;
         else if (!strcmp(argv[i], "--no-widescreen")) aspect_mode = ASPECT_4_3;
         else if (!strcmp(argv[i], "--overclock") && i + 1 < argc) overclock_setting = atoi(argv[++i]);
@@ -620,6 +655,7 @@ int main(int argc, char** argv) {
     if (audio_dev) SDL_PauseAudioDevice(audio_dev, 0);
     for (int i = 0; i < SDL_NumJoysticks(); i++) open_device(i);
 
+    pc_sampler_start();
     hw_init();
     cpu_init();
     gpu_init();
