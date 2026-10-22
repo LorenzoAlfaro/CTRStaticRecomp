@@ -721,7 +721,33 @@ static int texture_reads(const DrawCtx& d, int umin, int umax, int vmin, int vma
     return 2;
 }
 
+// Whether the displayed picture may have changed since the frontend last converted it:
+// set by writes that overlap the displayed VRAM area and by display setting changes. In
+// races CTR draws into the hidden buffer, so about every other refresh needs no conversion.
+static bool display_dirty = true;
+
+static void touch_display(const Rgn& w) {
+    if (display_dirty) return;
+    DisplayInfo d = gpu_display();
+    if (w.x1 > 1024 || w.y1 > 512 || d.x + d.w > 1024 || d.y + d.h > 512) {  // wraps: be conservative
+        display_dirty = true;
+        return;
+    }
+    int dw = d.rgb24 ? d.w * 3 / 2 : d.w;
+    if (w.x0 < d.x + dw && w.x1 > d.x && w.y0 < d.y + d.h && w.y1 > d.y) display_dirty = true;
+}
+
+bool gpu_take_display_dirty() {
+    bool v = display_dirty;
+    display_dirty = false;
+    return v;
+}
+
 static void queue_job(const Job& j, const Rgn* reads = nullptr, int nreads = 0) {
+    {
+        Rgn w[1];
+        if (job_writes(j, w)) touch_display(w[0]);
+    }
     if (threaded) {
         Rgn w[1];
         int nw = job_writes(j, w);
@@ -908,6 +934,7 @@ static void vram_copy() {
     if (t.test(dst)) {
         // a copy between different but overlapping rows depends on row order: do it here
         gpu_sync();
+        touch_display(dst);
         run_job(j, Band{0, 1});
         return;
     }
@@ -959,6 +986,7 @@ static void exec_command() {
         upload.x = cmd[1] & 0x3FF; upload.y = (cmd[1] >> 16) & 0x1FF;
         upload.w = ((cmd[2] & 0xFFFF) - 1) % 1024 + 1; upload.h = (((cmd[2] >> 16) & 0xFFFF) - 1) % 512 + 1;
         upload.cx = upload.cy = 0;
+        touch_display(Rgn{upload.x, upload.y, upload.x + upload.w, upload.y + upload.h});
         return;
     }
     case 6: {
@@ -1052,15 +1080,18 @@ void gpu_write_gp1(uint32_t v) {
         break;
     case 0x01: cmd_len = 0; polyline = false; upload.active = false; break;
     case 0x02: irq_flag = false; break;
-    case 0x03: display_disabled = v & 1; break;
+    case 0x03: display_dirty |= display_disabled != (bool)(v & 1); display_disabled = v & 1; break;
     case 0x04: dma_dir = v & 3; break;
     case 0x05:
-        if ((int)(v & 0x3FE) != disp_x || (int)((v >> 10) & 0x1FF) != disp_y) g_gpu_flips++;  // game frame shown
+        if ((int)(v & 0x3FE) != disp_x || (int)((v >> 10) & 0x1FF) != disp_y) {
+            g_gpu_flips++;  // game frame shown
+            display_dirty = true;
+        }
         disp_x = v & 0x3FE; disp_y = (v >> 10) & 0x1FF;
         break;
-    case 0x06: h_start = v & 0xFFF; h_end = (v >> 12) & 0xFFF; break;
-    case 0x07: v_start = v & 0x3FF; v_end = (v >> 10) & 0x3FF; break;
-    case 0x08: disp_mode = v & 0xFF; break;
+    case 0x06: display_dirty |= (h_start | (h_end << 12)) != (int)(v & 0xFFFFFF); h_start = v & 0xFFF; h_end = (v >> 12) & 0xFFF; break;
+    case 0x07: display_dirty |= (v_start | (v_end << 10)) != (int)(v & 0xFFFFF); v_start = v & 0x3FF; v_end = (v >> 10) & 0x3FF; break;
+    case 0x08: display_dirty |= disp_mode != (v & 0xFF); disp_mode = v & 0xFF; break;
     case 0x09: allow_tex_disable = v & 1; break;
     case 0x10: {
         uint32_t r = 0;
@@ -1165,6 +1196,7 @@ uint16_t gpu_vram_native(int x, int y) { return px(x, y); }
 int gpu_scale() { return 1 << sh; }
 
 void gpu_set_scale(int scale) {
+    display_dirty = true;
     int nsh = 0;
     while (nsh < 3 && (2 << nsh) <= scale) nsh++;
     gpu_sync();

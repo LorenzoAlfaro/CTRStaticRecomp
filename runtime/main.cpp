@@ -385,47 +385,61 @@ static void pc_sampler_report() {
 extern uint64_t g_gpu_stalls, g_gpu_stall_why[4], g_gpu_copies;
 extern double g_gpu_wait_s, g_gpu_full_s;
 static bool profile = getenv("CTR_PROFILE") != nullptr;  // or --profile
+static uint64_t g_presents = 0;
 
 void frontend_vblank() {
     frame_counter++;
     static double p_last = 0, p_sync = 0, p_conv = 0, p_present = 0;
     double t0 = now_seconds();
-    gpu_sync();
-    double t1 = now_seconds();
     display_size(frame_w, frame_h);
+    bool new_texture = false;
     if (!texture || frame_w > tex_w || frame_h > tex_h) {
         if (texture) SDL_DestroyTexture(texture);
         tex_w = std::max(frame_w, 1024);
         tex_h = std::max(frame_h, 512);
         texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h);
+        new_texture = true;
     }
-    SDL_Rect src = {0, 0, frame_w, frame_h};
-    bool shot_now = (shot_frame && frame_counter == shot_frame) || (shot_every && frame_counter % shot_every == 0);
-    void* pixels;
-    int pitch;
-    if (!shot_now && SDL_LockTexture(texture, &src, &pixels, &pitch) == 0) {
-        convert_display((uint32_t*)pixels, pitch / 4, frame_w, frame_h);
-        SDL_UnlockTexture(texture);
-    } else {
-        // screenshots keep a copy of the frame
-        if (frame.size() < (size_t)frame_w * frame_h) frame.resize((size_t)frame_w * frame_h);
-        convert_display(frame.data(), frame_w, frame_w, frame_h);
-        SDL_UpdateTexture(texture, &src, frame.data(), frame_w * 4);
-    }
-    double t2 = now_seconds();
     int ww, wh;
     SDL_GetRendererOutputSize(renderer, &ww, &wh);
     // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a wider
     // field of view into the same buffer, shown stretched to the target aspect
     apply_aspect();  // follows window size changes in fill mode (takes effect next frame)
     double a = aspect();
-    int dw = ww, dh = (int)(ww / a + 0.5);
-    if (dh > wh) { dh = wh; dw = (int)(wh * a + 0.5); }
-    SDL_Rect dst = {(ww - dw) / 2, (wh - dh) / 2, dw, dh};
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, &src, &dst);
-    SDL_RenderPresent(renderer);
+    bool shot_now = (shot_frame && frame_counter == shot_frame) || (shot_every && frame_counter % shot_every == 0);
+    // convert and present only when the picture can have changed (CTR draws races into the
+    // hidden buffer, so about every other refresh shows the same frame and is skipped)
+    static int last_ww = -1, last_wh = -1, last_fw = -1, last_fh = -1;
+    static double last_a = 0;
+    bool redraw = gpu_take_display_dirty() || new_texture || shot_now || ww != last_ww || wh != last_wh ||
+                  frame_w != last_fw || frame_h != last_fh || a != last_a;
+    double t1 = t0, t2 = t0;
+    if (redraw) {
+        last_ww = ww; last_wh = wh; last_fw = frame_w; last_fh = frame_h; last_a = a;
+        g_presents++;
+        gpu_sync();
+        t1 = now_seconds();
+        SDL_Rect src = {0, 0, frame_w, frame_h};
+        void* pixels;
+        int pitch;
+        if (!shot_now && SDL_LockTexture(texture, &src, &pixels, &pitch) == 0) {
+            convert_display((uint32_t*)pixels, pitch / 4, frame_w, frame_h);
+            SDL_UnlockTexture(texture);
+        } else {
+            // screenshots keep a copy of the frame
+            if (frame.size() < (size_t)frame_w * frame_h) frame.resize((size_t)frame_w * frame_h);
+            convert_display(frame.data(), frame_w, frame_w, frame_h);
+            SDL_UpdateTexture(texture, &src, frame.data(), frame_w * 4);
+        }
+        t2 = now_seconds();
+        int dw = ww, dh = (int)(ww / a + 0.5);
+        if (dh > wh) { dh = wh; dw = (int)(wh * a + 0.5); }
+        SDL_Rect dst = {(ww - dw) / 2, (wh - dh) / 2, dw, dh};
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, texture, &src, &dst);
+        SDL_RenderPresent(renderer);
+    }
     if (profile) {
         double t3 = now_seconds();
         p_sync += t1 - t0; p_conv += t2 - t1; p_present += t3 - t2;
@@ -440,7 +454,10 @@ void frontend_vblank() {
                  g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
             // the game's own frame rate: display buffer flips per 300 vblanks (emulated time)
             static uint64_t flips_last = 0;
-            LOGI("profile: game renders %.1f fps (CPU %d%%)", (g_gpu_flips - flips_last) * 59.826 / 300, overclock());
+            static uint64_t presents_last = 0;
+            LOGI("profile: game renders %.1f fps (CPU %d%%), presented %llu of 300 refreshes", (g_gpu_flips - flips_last) * 59.826 / 300,
+                 overclock(), (unsigned long long)(g_presents - presents_last));
+            presents_last = g_presents;
             flips_last = g_gpu_flips;
             g_gpu_wait_s = g_gpu_full_s = 0;
             g_gpu_copies = 0;
