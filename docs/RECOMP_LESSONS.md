@@ -284,6 +284,20 @@ recompilation.
   - a per-instruction widescreen hook call (3.5%).
 
   Check a device's ABI (`getprop ro.product.cpu.abilist`) before planning a port.
+
+  **Fixes so far (all verified byte-exact on the reference frames):**
+  - hook range test, inlined interpreter helpers, a function-lookup cache, render threads at
+    1x, ARMv7VE hardware divide: 48 → 25 ms/frame at 1x;
+  - span-based, mode-specialized rasterizer with 32-bit accumulators: 2x dropped from 44 to
+    26 ms (no more waiting on the render threads; the PC's 4x run went from 75 s to 29 s);
+  - **compiled interpreter regions** (`gen/flat.py`): the interpreter-only render asm is
+    compiled instruction by instruction into C that does exactly what `interp_run` does
+    (same cycles, events, transfers), with gotos and an address `switch` instead of decoding.
+
+  **Recompiling that asm as ordinary functions still breaks** (missing 3D models), so the
+  compiled-interpreter approach is the safe way to speed it up. One function per region took
+  more than 10 minutes to compile; 512-instruction chunks with a small driver loop build in
+  under 2 minutes.
 - **Testing on the device:** `--keys` and other options go through the launch intent
   (`am start -e args '...'`). Quote the whole command for `adb shell`, or the device shell splits
   the value at the first space.
@@ -311,6 +325,18 @@ CTR-ModSDK decomp project was used only as a reference:
 The separate first attempt (CTRRecomp, the decomp's PC port) is unrelated to this code.
 
 ---
+
+## Reusable for other PS1 recomps
+Almost everything except a small game-specific config carries over:
+- the recompiler and the compiled-interpreter regions (`gen/flat.py`; only the address ranges
+  are per game);
+- the runtime: HLE BIOS, GTE, GPU with upscaling/PGXP/threading, SPU, CD, SIO;
+- the CPU overclock, the Windows/Android/Android TV frontends, ARM64/ARMv7 setjmp;
+- the byte-exact screenshot regression method.
+
+Game-specific: widescreen patch points, interpreter-only ranges, scheduler/unwind overrides
+(CTR's `ThTick`), test key scripts, symbol map. Splitting these into a per-game config plus a
+shared library is the obvious first step for the next PS1 recomp.
 
 ## Checklist for the next recomp
 1. **Inventory the disc:** executable, overlays and their load regions, BIOS calls used, and

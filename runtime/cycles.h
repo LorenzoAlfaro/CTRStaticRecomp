@@ -15,7 +15,7 @@ static inline int gte_cmd_cycles(uint32_t w) {
     }
 }
 
-static inline int insn_cycles(uint32_t w) {
+static inline __attribute__((always_inline)) int insn_cycles(uint32_t w) {
     uint32_t op = w >> 26;
     if ((op >= 0x20 && op <= 0x26) || op == 0x32) return 5;  // loads (incl. lwc2)
     if (op == 0) {

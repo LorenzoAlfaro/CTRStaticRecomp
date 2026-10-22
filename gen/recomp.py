@@ -40,8 +40,10 @@ UNWIND_RESUME_FASTRET = 0x80071694
 HOOKS = {0x80042E34, 0x80043170, 0x80043280}
 INTERP_ONLY_MAIN = [(0x80069BB0, 0x800715E8)]  # DrawSky .. RenderBucket_* .. TRIG_* (render asm)
 INTERP_ONLY_OVERLAYS = {226, 227, 228, 229}      # per-player-count level renderers
-if os.environ.get("RECOMP_NO_INTERP_ONLY") == "1":  # debugging: recompile the asm too
+# experiments: RECOMP_NO_INTERP_ONLY=1 recompiles all of the asm, =main only the main-executable part
+if os.environ.get("RECOMP_NO_INTERP_ONLY") in ("1", "main"):
     INTERP_ONLY_MAIN = []
+if os.environ.get("RECOMP_NO_INTERP_ONLY") == "1":
     INTERP_ONLY_OVERLAYS = set()
 
 
@@ -908,10 +910,18 @@ def emit(args, main_mod):
         f.write(f"const int g_overlay_count = {len(MODULES) - 1};\n")
         f.write(f"const uint32_t g_exe_hash = {fnv1a(main_mod.data):#x}u;\n")
 
+    # the interpreter-only code, compiled instruction by instruction (gen/flat.py)
+    import flat
+    regs = [] if os.environ.get("RECOMP_NO_FLAT") == "1" else \
+        flat.regions(main_mod, MODULES[1:], INTERP_ONLY_MAIN, INTERP_ONLY_OVERLAYS)
+    with write_if_changed(os.path.join(out, "flat_regions.c")) as f:
+        flat.write(f, regs)
+
     with open(os.path.join(out, "sources.txt"), "w") as f:
         for n in range(nfiles):
             f.write(f"funcs_{n:02d}.c\n")
         f.write("func_table.c\n")
+        f.write("flat_regions.c\n")
 
     with open(os.path.join(out, "recomp_report.txt"), "w") as rep:
         for mod in MODULES:

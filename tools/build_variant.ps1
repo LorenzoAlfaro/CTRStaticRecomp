@@ -7,6 +7,7 @@ $pkgs = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
 $llvm = Get-ChildItem $pkgs -Directory -Filter "MartinStorsjo.LLVM-MinGW*" | ForEach-Object { Get-ChildItem $_.FullName -Directory } | Select-Object -First 1
 $ninja = Get-ChildItem $pkgs -Directory -Filter "Ninja-build.Ninja*" | Select-Object -First 1
 $env:PATH = "$($llvm.FullName)\bin;$($ninja.FullName);C:\Program Files\CMake\bin;$env:PATH"
+if (Test-Path "$env:LOCALAPPDATA\Python\bin\python.exe") { $env:PATH = "$env:LOCALAPPDATA\Python\bin;$env:PATH" }  # not the Store alias
 $saved = @{}
 foreach ($k in $Env.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
 try {

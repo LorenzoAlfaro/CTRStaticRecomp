@@ -211,6 +211,25 @@ void rt_invalid(CPU* c, uint32_t pc);
 void rt_fallthrough(CPU* c, uint32_t pc);
 void rt_warn_delay(CPU* c, uint32_t pc);
 
+// Interpreter-only code compiled instruction by instruction (gen/flat.py). A region
+// function runs from pc exactly like interp_run would, returning the pc where execution
+// left the region, or setting *done when interp_run would have returned.
+typedef uint32_t (*FlatFunc)(CPU* c, uint32_t pc, uint32_t stop, int* depth, int* done);
+typedef struct FlatRegion {
+    uint32_t lo, hi;        // code range
+    int ovr;                // 0 = main executable, else overlay index
+    FlatFunc fn;
+    const uint32_t* words;  // the code it was compiled from (overlay residency check)
+} FlatRegion;
+extern const FlatRegion g_flat_regions[];
+extern const int g_flat_region_count;
+// interp_run building blocks used by the generated region functions
+uint32_t rt_flat_transfer(CPU* c, uint32_t t, uint32_t ret, int link, uint32_t stop, int* depth);
+void rt_flat_exec(CPU* c, uint32_t w, uint32_t pc);  // one non-control instruction
+void rt_flat_exec_delay(CPU* c, uint32_t at);        // the delay slot after at (read from memory)
+void rt_flat_nonlocal(uint32_t target);
+int rt_is_func_entry(uint32_t t);
+
 // Enhancement hooks (runtime/hooks.cpp): the recompiler emits a call before each
 // instruction listed in gen/recomp.py HOOKS; the interpreter checks rt_is_hook().
 extern int g_hooks_on;

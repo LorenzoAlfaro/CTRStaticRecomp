@@ -25,7 +25,7 @@ set(GEN_DIR "${CMAKE_SOURCE_DIR}/build/gen" CACHE PATH "Output of gen/recomp.py"
 if(NOT EXISTS "${GEN_DIR}/func_table.c")
   message(FATAL_ERROR "Run gen/recomp.py first (see build.ps1); expected ${GEN_DIR}/func_table.c")
 endif()
-file(GLOB GEN_SOURCES "${GEN_DIR}/funcs_*.c" "${GEN_DIR}/func_table.c")
+file(GLOB GEN_SOURCES "${GEN_DIR}/funcs_*.c" "${GEN_DIR}/func_table.c" "${GEN_DIR}/flat_regions.c")
 add_library(ctr_gen STATIC ${GEN_SOURCES})
 target_include_directories(ctr_gen PUBLIC runtime ${GEN_DIR})
 target_compile_options(ctr_gen PRIVATE -O2 -g1 -fwrapv -fno-strict-aliasing -w)

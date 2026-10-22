@@ -213,7 +213,104 @@ static inline int64_t edge(const Vertex& a, const Vertex& b, int64_t x, int64_t 
 
 static inline int ceil_sub(int32_t v) { return (int)((v + (1 << SUB) - 1) >> SUB); }
 
-static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Band band) {
+// Texture fetch with the depth known at compile time (see sample_tex).
+template <int DEPTH>
+static inline __attribute__((always_inline)) uint16_t sample_tex_d(const DrawCtx& d, int u, int v) {
+    u &= 0xFF;
+    v &= 0xFF;
+    u = (u & ~(d.tw_mask_x * 8)) | ((d.tw_off_x & d.tw_mask_x) * 8);
+    v = (v & ~(d.tw_mask_y * 8)) | ((d.tw_off_y & d.tw_mask_y) * 8);
+    if (DEPTH == 0) {
+        uint16_t w = px(d.tp_x + (u >> 2), d.tp_y + v);
+        return px(d.clut_x + ((w >> ((u & 3) * 4)) & 0xF), d.clut_y);
+    }
+    if (DEPTH == 1) {
+        uint16_t w = px(d.tp_x + (u >> 1), d.tp_y + v);
+        return px(d.clut_x + ((w >> ((u & 1) * 8)) & 0xFF), d.clut_y);
+    }
+    return px(d.tp_x + u, d.tp_y + v);
+}
+
+// One triangle pixel: plot() with the drawing mode fixed at compile time.
+// T textured, G gouraud, R raw texture, D dither, S semi-transparent, DEPTH texture depth.
+template <bool T, bool G, bool R, bool D, bool S, int DEPTH>
+static inline __attribute__((always_inline)) void shade(const DrawCtx& d, uint16_t* dst, int x, const int* dither_row,
+                                                        int r, int g, int b, int u, int v) {
+    if (d.mask_check && (*dst & 0x8000)) return;
+    uint16_t out;
+    bool semi_px = S;
+    if (T) {
+        uint16_t t = sample_tex_d<DEPTH>(d, u, v);
+        if (t == 0) return;
+        semi_px = S && (t & 0x8000);
+        int tr = t & 31, tg = (t >> 5) & 31, tb = (t >> 10) & 31;
+        if (!R) {
+            if (D) {
+                int dt = dither_row[(x >> sh) & 3];
+                int rr = std::clamp(((tr << 3) * r >> 7) + dt, 0, 255);
+                int gg = std::clamp(((tg << 3) * g >> 7) + dt, 0, 255);
+                int bb = std::clamp(((tb << 3) * b >> 7) + dt, 0, 255);
+                tr = rr >> 3; tg = gg >> 3; tb = bb >> 3;
+            } else {
+                tr = std::min(31, tr * r >> 7);
+                tg = std::min(31, tg * g >> 7);
+                tb = std::min(31, tb * b >> 7);
+            }
+        }
+        out = (uint16_t)(tr | (tg << 5) | (tb << 10) | (t & 0x8000));
+    } else {
+        if (D) {
+            int dt = dither_row[(x >> sh) & 3];
+            r = std::clamp(r + dt, 0, 255);
+            g = std::clamp(g + dt, 0, 255);
+            b = std::clamp(b + dt, 0, 255);
+        }
+        out = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+    }
+    if (S && semi_px) {
+        uint16_t bg_px = *dst;
+        int br = bg_px & 31, bg = (bg_px >> 5) & 31, bb = (bg_px >> 10) & 31;
+        int fr = out & 31, fg = (out >> 5) & 31, fb = (out >> 10) & 31;
+        switch (d.semi_mode) {
+        case 0: fr = (br + fr) >> 1; fg = (bg + fg) >> 1; fb = (bb + fb) >> 1; break;
+        case 1: fr = std::min(31, br + fr); fg = std::min(31, bg + fg); fb = std::min(31, bb + fb); break;
+        case 2: fr = std::max(0, br - fr); fg = std::max(0, bg - fg); fb = std::max(0, bb - fb); break;
+        default: fr = std::min(31, br + (fr >> 2)); fg = std::min(31, bg + (fg >> 2)); fb = std::min(31, bb + (fb >> 2)); break;
+        }
+        out = (uint16_t)(fr | (fg << 5) | (fb << 10) | (out & 0x8000));
+    }
+    if (d.mask_set) out |= 0x8000;
+    *dst = out;
+}
+
+// One row span [xs, xe). Attribute accumulators are 16.16 (+0x8000 rounding) of type A:
+// int32_t when the whole span provably fits, int64_t otherwise (same results either way).
+template <typename A, bool T, bool G, bool R, bool D, bool S, int DEPTH>
+static inline __attribute__((always_inline)) void tri_span(const DrawCtx& d, uint16_t* row, int xs, int xe,
+                                                           const int* dither_row, int r0, int g0, int b0,
+                                                           A ra, A ga, A ba, A ua, A va,
+                                                           A rdx, A gdx, A bdx, A udx, A vdx) {
+    for (int x = xs; x < xe; x++) {
+        int r = r0, g = g0, b = b0, u = 0, v = 0;
+        if (G) {
+            r = std::clamp((int)(ra >> 16), 0, 255);
+            g = std::clamp((int)(ga >> 16), 0, 255);
+            b = std::clamp((int)(ba >> 16), 0, 255);
+            ra += rdx; ga += gdx; ba += bdx;
+        }
+        if (T) {
+            u = std::clamp((int)(ua >> 16), 0, 255);
+            v = std::clamp((int)(va >> 16), 0, 255);
+            ua += udx; va += vdx;
+        }
+        shade<T, G, R, D, S, DEPTH>(d, row + x, x, dither_row, r, g, b, u, v);
+    }
+}
+
+static inline bool fits32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+
+template <bool T, bool G, bool R, bool D, bool S, int DEPTH>
+static void draw_triangle_t(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Band band) {
     int64_t area = edge(v0, v1, v2.x, v2.y);
     if (area == 0) return;
     if (area < 0) { std::swap(v1, v2); area = -area; }
@@ -234,12 +331,12 @@ static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Ban
         ddy = std::clamp(((da2 * dx1 - da1 * dx2) << (16 + SUB)) / den, -lim, lim);
     };
     int64_t rdx = 0, rdy = 0, gdx = 0, gdy = 0, bdx = 0, bdy = 0, udx = 0, udy = 0, vdx = 0, vdy = 0;
-    if (d.gouraud) {
+    if (G) {
         grad(v0.r, v1.r, v2.r, rdx, rdy);
         grad(v0.g, v1.g, v2.g, gdx, gdy);
         grad(v0.b, v1.b, v2.b, bdx, bdy);
     }
-    if (d.textured) {
+    if (T) {
         grad(v0.u, v1.u, v2.u, udx, udy);
         grad(v0.v, v1.v, v2.v, vdx, vdy);
     }
@@ -248,61 +345,94 @@ static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Ban
         int dy = b.y - a.y, dx = b.x - a.x;
         return dy < 0 || (dy == 0 && dx > 0);
     };
-    int bias0 = is_tl(v1, v2) ? 0 : -1;
-    int bias1 = is_tl(v2, v0) ? 0 : -1;
-    int bias2 = is_tl(v0, v1) ? 0 : -1;
+    const int bias[3] = {is_tl(v1, v2) ? 0 : -1, is_tl(v2, v0) ? 0 : -1, is_tl(v0, v1) ? 0 : -1};
     const int64_t one = 1 << SUB;
-    int64_t s0 = -(int64_t)(v2.y - v1.y) * one, s1 = -(int64_t)(v0.y - v2.y) * one, s2 = -(int64_t)(v1.y - v0.y) * one;
+    const int64_t step[3] = {-(int64_t)(v2.y - v1.y) * one, -(int64_t)(v0.y - v2.y) * one, -(int64_t)(v1.y - v0.y) * one};
 
     // attribute value at (x, y) = a0 + (ddx * (x - x0) + ddy * (y - y0)), positions in SUB units
     auto start = [&](int a0, int64_t ddx, int64_t ddy, int64_t fx, int64_t fy) {
         return ((int64_t)a0 << 16) + ((ddx * fx + ddy * fy) >> SUB) + 0x8000;
     };
+    const int n = maxx - minx;
     for (int y = miny; y < maxy; y++) {
         if (!band.mine(y)) continue;
         int64_t sx = (int64_t)minx << SUB, sy = (int64_t)y << SUB;
-        int64_t w0 = edge(v1, v2, sx, sy), w1 = edge(v2, v0, sx, sy), w2 = edge(v0, v1, sx, sy);
-        // skip the empty span left of the triangle on this row
-        int x = minx;
-        auto first_inside = [&](int64_t w, int64_t s, int bias) -> int64_t {
-            if (w + bias >= 0) return 0;
-            if (s <= 0) return INT64_MAX;
-            return (-(w + bias) + s - 1) / s;
-        };
-        int64_t skip = std::max({first_inside(w0, s0, bias0), first_inside(w1, s1, bias1), first_inside(w2, s2, bias2)});
-        if (skip >= maxx - minx) continue;
-        x += (int)skip;
-        w0 += s0 * skip; w1 += s1 * skip; w2 += s2 * skip;
-        int64_t fx = ((int64_t)x << SUB) - v0.x, fy = sy - v0.y;
+        const int64_t w[3] = {edge(v1, v2, sx, sy) + bias[0], edge(v2, v0, sx, sy) + bias[1], edge(v0, v1, sx, sy) + bias[2]};
+        // the covered samples k (x = minx + k) satisfy w_i + step_i * k >= 0 for all three edges;
+        // each edge bounds k from one side, so the span is [lo, hi] (a triangle is convex)
+        int64_t lo = 0, hi = n - 1;
+        bool empty = false;
+        for (int i = 0; i < 3 && !empty; i++) {
+            int64_t wi = w[i], s = step[i];
+            if (s > 0) {
+                if (wi < 0) lo = std::max(lo, (-wi + s - 1) / s);
+            } else if (s < 0) {
+                if (wi < 0) empty = true;
+                else if (wi + s * hi < 0) hi = std::min(hi, wi / -s);
+            } else if (wi < 0) {
+                empty = true;
+            }
+        }
+        if (empty || lo > hi) continue;
+        int xs = minx + (int)lo, xe = minx + (int)hi + 1;
+        uint16_t* row = &vram[(size_t)y << (10 + sh)];
+        const int* dither_row = dither_tab[(y >> sh) & 3];
+        int64_t fx = ((int64_t)xs << SUB) - v0.x, fy = sy - v0.y;
         int64_t ra = 0, ga = 0, ba = 0, ua = 0, va = 0;
-        if (d.gouraud) {
+        if (G) {
             ra = start(v0.r, rdx, rdy, fx, fy);
             ga = start(v0.g, gdx, gdy, fx, fy);
             ba = start(v0.b, bdx, bdy, fx, fy);
         }
-        if (d.textured) {
+        if (T) {
             ua = start(v0.u, udx, udy, fx, fy);
             va = start(v0.v, vdx, vdy, fx, fy);
         }
-        for (; x < maxx; x++, w0 += s0, w1 += s1, w2 += s2, ra += rdx, ga += gdx, ba += bdx, ua += udx, va += vdx) {
-            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0) {
-                // convex: once inside, leaving means the span is done
-                if (x > minx + skip) break;
-                continue;
-            }
-            int r = v0.r, g = v0.g, b = v0.b, u = 0, v = 0;
-            if (d.gouraud) {
-                r = std::clamp((int)(ra >> 16), 0, 255);
-                g = std::clamp((int)(ga >> 16), 0, 255);
-                b = std::clamp((int)(ba >> 16), 0, 255);
-            }
-            if (d.textured) {
-                u = std::clamp((int)(ua >> 16), 0, 255);
-                v = std::clamp((int)(va >> 16), 0, 255);
-            }
-            plot(d, x, y, r, g, b, u, v);
-        }
+        // 32-bit accumulators when every value along the span fits (linear: check both ends)
+        int64_t len = xe - xs - 1;
+        bool narrow = true;
+        auto check = [&](int64_t a, int64_t dd) {
+            narrow = narrow && fits32(dd) && fits32(a) && fits32(a + dd * len);
+        };
+        if (G) { check(ra, rdx); check(ga, gdx); check(ba, bdx); }
+        if (T) { check(ua, udx); check(va, vdx); }
+        if (narrow)
+            tri_span<int32_t, T, G, R, D, S, DEPTH>(d, row, xs, xe, dither_row, v0.r, v0.g, v0.b,
+                                                    (int32_t)ra, (int32_t)ga, (int32_t)ba, (int32_t)ua, (int32_t)va,
+                                                    (int32_t)rdx, (int32_t)gdx, (int32_t)bdx, (int32_t)udx, (int32_t)vdx);
+        else
+            tri_span<int64_t, T, G, R, D, S, DEPTH>(d, row, xs, xe, dither_row, v0.r, v0.g, v0.b,
+                                                    ra, ga, ba, ua, va, rdx, gdx, bdx, udx, vdx);
     }
+}
+
+// pick the specialization for a primitive's drawing mode
+using TriFn = void (*)(const DrawCtx&, Vertex, Vertex, Vertex, Band);
+template <bool T, bool G, bool R, bool D, bool S>
+static TriFn pick_tri_depth(int depth) {
+    if (!T || depth >= 2) return draw_triangle_t<T, G, R, D, S, 2>;
+    return depth == 0 ? draw_triangle_t<T, G, R, D, S, 0> : draw_triangle_t<T, G, R, D, S, 1>;
+}
+template <bool T, bool G, bool R, bool D>
+static TriFn pick_tri_s(const DrawCtx& d) {
+    return d.semi ? pick_tri_depth<T, G, R, D, true>(d.tp_depth) : pick_tri_depth<T, G, R, D, false>(d.tp_depth);
+}
+template <bool T, bool G, bool R>
+static TriFn pick_tri_d(const DrawCtx& d) {
+    return d.do_dither ? pick_tri_s<T, G, R, true>(d) : pick_tri_s<T, G, R, false>(d);
+}
+template <bool T, bool G>
+static TriFn pick_tri_r(const DrawCtx& d) {
+    return (T && d.raw) ? pick_tri_d<T, G, true>(d) : pick_tri_d<T, G, false>(d);
+}
+template <bool T>
+static TriFn pick_tri_g(const DrawCtx& d) {
+    return d.gouraud ? pick_tri_r<T, true>(d) : pick_tri_r<T, false>(d);
+}
+
+static void draw_triangle(const DrawCtx& d, Vertex v0, Vertex v1, Vertex v2, Band band) {
+    TriFn fn = d.textured ? pick_tri_g<true>(d) : pick_tri_g<false>(d);
+    fn(d, v0, v1, v2, band);
 }
 
 // ---- rectangles / lines / fills ---------------------------------------------------------
@@ -786,7 +916,8 @@ static void vram_copy() {
 
 static void start_workers() {
     unsigned hc = std::thread::hardware_concurrency();
-    n_workers = (int)std::clamp<unsigned>(hc > 2 ? hc - 2 : 1, 1, 12);
+    // leave a core for the emulation thread (and one for the system on bigger CPUs)
+    n_workers = (int)std::clamp<unsigned>(hc >= 6 ? hc - 2 : (hc > 1 ? hc - 1 : 1), 1, 12);
     if (const char* e = getenv("CTR_GPU_THREADS")) n_workers = std::clamp(atoi(e), 1, 32);
     workers = new WorkerState[n_workers];
     for (int i = 0; i < n_workers; i++) workers[i].th = std::thread(worker_main, i);

@@ -96,13 +96,50 @@ static void verify_escape_check(int target_retsp, int target_unwind) {
     }
 }
 
+// Direct-mapped cache in front of the lookup maps (the interpreter asks on every call and
+// jump). The tables never change after cpu_init, so "no function here", main-executable
+// functions and overrides are cached for good; overlay functions still get their residency
+// check on every lookup (overlay code can be copied in by the CPU as well as by DMA).
+enum : uint8_t { LC_EMPTY, LC_NONE, LC_FN, LC_OVERLAY };
+struct LookupCacheEntry {
+    uint32_t addr;
+    uint8_t state;
+    RecompFunc fn;
+    std::vector<Candidate>* cands;
+};
+static LookupCacheEntry g_lookup_cache[4096];
+
+static LookupCacheEntry& lookup_entry(uint32_t addr) {
+    LookupCacheEntry& e = g_lookup_cache[(addr >> 2) & 4095];
+    if (e.state != LC_EMPTY && e.addr == addr) return e;
+    e.addr = addr;
+    e.state = LC_NONE;
+    auto ov = g_overrides.find(addr);
+    if (ov != g_overrides.end()) {
+        e.state = LC_FN;
+        e.fn = ov->second;
+        return e;
+    }
+    auto it = g_lookup.find(addr);
+    if (it == g_lookup.end()) return e;
+    bool overlay = false;
+    for (auto& cand : it->second) overlay |= cand.e->ovr != 0;
+    if (overlay) {
+        e.state = LC_OVERLAY;
+        e.cands = &it->second;
+    } else {
+        e.state = LC_FN;
+        e.fn = it->second.front().e->fn;
+    }
+    return e;
+}
+
 bool cpu_lookup(uint32_t addr, RecompFunc* out) {
     if (g_pure_interp) return false;
-    auto ov = g_overrides.find(addr);
-    if (ov != g_overrides.end()) { *out = ov->second; return true; }
-    auto it = g_lookup.find(addr);
-    if (it == g_lookup.end()) return false;
-    for (auto& cand : it->second) {
+    LookupCacheEntry& e = lookup_entry(addr);
+    if (e.state == LC_FN) { *out = e.fn; return true; }
+    if (e.state != LC_OVERLAY) return false;
+    for (auto& cand : *e.cands) {
         if (cand.e->ovr == 0 || overlay_resident(cand)) {
             *out = cand.e->fn;
             return true;
@@ -111,8 +148,11 @@ bool cpu_lookup(uint32_t addr, RecompFunc* out) {
     return false;
 }
 
+static void flat_init();
+
 void cpu_init() {
     memset(&g_cpu, 0, sizeof g_cpu);
+    memset(g_lookup_cache, 0, sizeof g_lookup_cache);
     g_lookup.clear();
     for (int i = 0; i < g_func_table_count; i++) {
         const FuncEntry* e = &g_func_table[i];
@@ -120,6 +160,7 @@ void cpu_init() {
     }
     g_overrides[0x800716EC] = rt_ThTick_SetAndExec;
     g_overrides[0x80071694] = rt_ThTick_FastRET;
+    flat_init();
     g_cpu.cop0[12] = 0x10900000;  // SR: COP0 usable, BEV
     g_cpu.cop0[15] = 0x00000002;  // PRId
 }
@@ -145,8 +186,62 @@ void rt_nonlocal_return_check(uint32_t target);
 static inline __attribute__((always_inline)) void interp_exec_simple(CPU* c, uint32_t w, uint32_t pc);
 
 static inline bool is_func_entry(uint32_t t) {
-    t = canon(t);
-    return g_lookup.count(t) || g_overrides.count(t);
+    return lookup_entry(canon(t)).state != LC_NONE;
+}
+
+// transfer control to t as a call (link) or jump: BIOS vectors and recompiled functions run
+// to completion here; returns the next pc to interpret
+static inline __attribute__((always_inline)) uint32_t transfer(CPU* c, uint32_t t, uint32_t ret, bool link,
+                                                                uint32_t stop, int& depth) {
+    uint32_t tc = canon(t);
+    uint32_t p = tc & 0x1FFFFFFF;
+    if (p == 0xA0 || p == 0xB0 || p == 0xC0) {
+        bios_call(c, p);
+        return link ? ret : c->r[31];
+    }
+    RecompFunc fn;
+    if (cpu_lookup(tc, &fn)) {
+        uint32_t cont = link ? ret : c->r[31];
+        fn(c);
+        return cont;
+    }
+    if (g_trace_on && is_func_entry(tc)) rt_trace(c, tc);  // mirror native TRACE_ENTRY
+    if (link && ret == stop) depth++;
+    return t;
+}
+
+// Compiled interpreter-only regions (gen/flat.py), unless running the pure interpreter.
+// Overlay regions are used only while that overlay is resident, checked like cpu_lookup:
+// the next 16 bytes every time, the whole region again after DMA changed RAM.
+static uint32_t g_flat_lo = 0, g_flat_span = 0;  // bounding range of all regions (fast reject)
+static uint64_t g_flat_verified[16];
+
+static void flat_init() {
+    uint32_t lo = 0xFFFFFFFF, hi = 0;
+    for (int i = 0; i < g_flat_region_count; i++) {
+        lo = std::min(lo, g_flat_regions[i].lo);
+        hi = std::max(hi, g_flat_regions[i].hi);
+        if (i < 16) g_flat_verified[i] = UINT64_MAX;
+    }
+    g_flat_lo = lo;
+    g_flat_span = hi > lo ? hi - lo : 0;
+}
+
+static const FlatRegion* flat_find(uint32_t pc) {
+    if (g_pure_interp) return nullptr;
+    for (int i = 0; i < g_flat_region_count && i < 16; i++) {
+        const FlatRegion& fr = g_flat_regions[i];
+        if (pc < fr.lo || pc >= fr.hi || (pc & 3)) continue;
+        if (fr.ovr == 0) return &fr;
+        uint32_t off = pc - fr.lo, n = std::min<uint32_t>(16, fr.hi - pc);
+        if (memcmp(g_ram + (pc & 0x1FFFFF), (const uint8_t*)fr.words + off, n) != 0) continue;
+        if (g_flat_verified[i] != g_dma_generation) {
+            if (memcmp(g_ram + (fr.lo & 0x1FFFFF), fr.words, fr.hi - fr.lo) != 0) continue;
+            g_flat_verified[i] = g_dma_generation;
+        }
+        return &fr;
+    }
+    return nullptr;
 }
 
 // Interpreter. Event checks and cycle accounting follow exactly the same rules as the
@@ -155,33 +250,24 @@ static inline bool is_func_entry(uint32_t t) {
 void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
     int depth = 0;
     uint32_t* r = c->r;
-    count_miss(canon(pc));
+    if (g_log_level >= LOG_DEBUG) count_miss(canon(pc));  // only reported in debug logs
     if (g_trace_on && g_pure_interp && is_func_entry(canon(pc))) rt_trace(c, canon(pc));
-    auto exec_delay = [&](uint32_t at) {
+    auto exec_delay = [&](uint32_t at) __attribute__((always_inline)) {
         uint32_t dw = MEM_LW(at + 4);
         c->pc = at + 4;
         rt_cyc(c, insn_cycles(dw));
         interp_exec_simple(c, dw, at + 4);
     };
-    // transfer control to t as a call (link) or jump; returns next pc to interpret
-    auto transfer = [&](uint32_t t, uint32_t ret, bool link) -> uint32_t {
-        uint32_t tc = canon(t);
-        uint32_t p = tc & 0x1FFFFFFF;
-        if (p == 0xA0 || p == 0xB0 || p == 0xC0) {
-            bios_call(c, p);
-            return link ? ret : r[31];
-        }
-        RecompFunc fn;
-        if (cpu_lookup(tc, &fn)) {
-            uint32_t cont = link ? ret : r[31];
-            fn(c);
-            return cont;
-        }
-        if (g_trace_on && is_func_entry(tc)) rt_trace(c, tc);  // mirror native TRACE_ENTRY
-        if (link && ret == stop) depth++;
-        return t;
-    };
     for (;;) {
+        // compiled region: runs until it leaves the region or interp_run would return
+        if (pc - g_flat_lo < g_flat_span) {
+            if (const FlatRegion* fr = flat_find(pc)) {
+                int done = 0;
+                pc = fr->fn(c, pc, stop, &depth, &done);
+                if (done) return;
+                continue;
+            }
+        }
         if (pc == stop) {
             if (depth == 0) return;
             depth--;
@@ -201,10 +287,10 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
             if (!link) {
                 if (t == stop && depth == 0) return;
                 rt_nonlocal_return_check(t);
-                pc = transfer(t, pc + 8, false);
+                pc = transfer(c, t, pc + 8, false, stop, depth);
             } else {
                 CHECK_EVENTS(c);
-                pc = transfer(t, pc + 8, true);
+                pc = transfer(c, t, pc + 8, true, stop, depth);
             }
             continue;
         }
@@ -213,7 +299,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
             if (op == 0x03) r[31] = pc + 8;
             exec_delay(pc);
             if (op == 0x03 || t <= pc || is_func_entry(t)) CHECK_EVENTS(c);
-            pc = transfer(t, pc + 8, op == 0x03);
+            pc = transfer(c, t, pc + 8, op == 0x03, stop, depth);
             continue;
         }
         if (op == 0x01 || (op >= 0x04 && op <= 0x07)) {  // branches
@@ -231,7 +317,7 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
             if (!taken) { pc += 8; continue; }
             if (link) {
                 CHECK_EVENTS(c);
-                pc = transfer(target, pc + 8, true);
+                pc = transfer(c, target, pc + 8, true, stop, depth);
             } else {
                 if (target <= pc) CHECK_EVENTS(c);
                 pc = target;
@@ -410,6 +496,20 @@ void rt_nonlocal_return_check(uint32_t target) {
 using namespace psx;
 
 extern "C" {
+
+// building blocks for the compiled interpreter regions (gen/flat.py), shared with interp_run
+uint32_t rt_flat_transfer(CPU* c, uint32_t t, uint32_t ret, int link, uint32_t stop, int* depth) {
+    return transfer(c, t, ret, link != 0, stop, *depth);
+}
+void rt_flat_exec(CPU* c, uint32_t w, uint32_t pc) { interp_exec_simple(c, w, pc); }
+void rt_flat_exec_delay(CPU* c, uint32_t at) {
+    uint32_t dw = MEM_LW(at + 4);
+    c->pc = at + 4;
+    rt_cyc(c, insn_cycles(dw));
+    interp_exec_simple(c, dw, at + 4);
+}
+void rt_flat_nonlocal(uint32_t target) { rt_nonlocal_return_check(target); }
+int rt_is_func_entry(uint32_t t) { return is_func_entry(t) ? 1 : 0; }
 
 void rt_check_events(CPU* c) {
     if (g_in_verify) { c->next_event = INT64_MAX; return; }  // comparisons run without events
