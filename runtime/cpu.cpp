@@ -509,6 +509,12 @@ void rt_flat_exec_delay(CPU* c, uint32_t at) {
     interp_exec_simple(c, dw, at + 4);
 }
 void rt_flat_nonlocal(uint32_t target) { rt_nonlocal_return_check(target); }
+int rt_flat_nonlocal_needed(uint32_t target) {
+    if (g_pure_interp) return 0;
+    for (int k = g_retsp - 2; k >= 0; k--)
+        if (g_retframes[k].ret == target) return 1;
+    return 0;
+}
 int rt_is_func_entry(uint32_t t) { return is_func_entry(t) ? 1 : 0; }
 
 void rt_check_events(CPU* c) {

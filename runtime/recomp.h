@@ -230,6 +230,7 @@ uint32_t rt_flat_transfer(CPU* c, uint32_t t, uint32_t ret, int link, uint32_t s
 void rt_flat_exec(CPU* c, uint32_t w, uint32_t pc);  // one non-control instruction
 void rt_flat_exec_delay(CPU* c, uint32_t at);        // the delay slot after at (read from memory)
 void rt_flat_nonlocal(uint32_t target);
+int rt_flat_nonlocal_needed(uint32_t target);  // would rt_flat_nonlocal longjmp? (no side effects)
 int rt_is_func_entry(uint32_t t);
 
 // Enhancement hooks (runtime/hooks.cpp): the recompiler emits a call before each

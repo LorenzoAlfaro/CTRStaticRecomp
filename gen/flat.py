@@ -15,6 +15,7 @@ Generated function signature (see FlatRegion in runtime/recomp.h):
 returns the pc where execution left the region, or sets *done when interp_run would have
 returned (stop reached at depth 0).
 """
+import re
 import struct
 
 
@@ -56,7 +57,7 @@ def simple(w, a):
     sa, imm = (w >> 6) & 31, w & 0xFFFF
     simm = s16(imm) & 0xFFFFFFFF
     # pending cycles must be in c->cycles before anything that can look at them
-    fallback = f"FLUSH(); c->pc = {a:#010x}u; rt_flat_exec(c, {w:#010x}u, {a:#010x}u);"
+    fallback = f"FLUSH(); c->pc = {a:#010x}u; SPILL(); rt_flat_exec(c, {w:#010x}u, {a:#010x}u); RELOAD();"
 
     def wr(dst, expr):
         return f"r[{dst}] = {expr};" if dst else f"(void)({expr});"
@@ -141,7 +142,7 @@ def simple(w, a):
     return fallback  # COP0, invalid
 
 
-CHUNK = 512  # instructions per generated C function (huge functions compile very slowly)
+CHUNK = 256  # instructions per generated C function (huge functions compile very slowly)
 
 
 class FlatRegion:
@@ -163,11 +164,30 @@ class FlatRegion:
     def delay(self, a):
         """The delay slot at a + 4, as interp_run's exec_delay."""
         if a + 4 >= self.hi:
-            return f"FLUSH(); rt_flat_exec_delay(c, {a:#010x}u);"
+            return f"FLUSH(); SPILL(); rt_flat_exec_delay(c, {a:#010x}u); RELOAD();"
         w = self.word(a + 4)
         if is_control(w):  # interp_exec_simple treats it as invalid
-            return f"n += {insn_cycles(w)}; FLUSH(); c->pc = {a + 4:#010x}u; rt_flat_exec(c, {w:#010x}u, {a + 4:#010x}u);"
+            return (f"n += {insn_cycles(w)}; FLUSH(); c->pc = {a + 4:#010x}u; "
+                    f"SPILL(); rt_flat_exec(c, {w:#010x}u, {a + 4:#010x}u); RELOAD();")
         return f"c->pc = {a + 4:#010x}u; n += {insn_cycles(w)}; {simple(w, a + 4)}"
+
+    def in_region(self, t):
+        return self.lo <= t < self.hi and not (t & 3)
+
+    def xfer(self, target, ret, link):
+        """interp_run's transfer(): BIOS vectors and recompiled functions run to completion,
+        anything else continues there. The regions contain no recompiled functions or BIOS
+        vectors, so a target inside this region only needs transfer's depth bookkeeping and
+        can be reached directly (unless tracing, which transfer also does)."""
+        slow = (f"SPILL(); pc = rt_flat_transfer(c, {target}, {ret:#010x}u, {1 if link else 0}, stop, &depth); "
+                "RELOAD(); goto dispatch;")
+        depth = f"if ({ret:#010x}u == stop) depth++; " if link else ""
+        if isinstance(target, int):
+            if self.in_region(target):
+                return f"if (!g_trace_on) {{ {depth}{self.goto(target)} }} {slow}"
+            return slow
+        return (f"if (t - {self.lo:#010x}u < {self.hi - self.lo:#x}u && !(t & 3) && !g_trace_on) "
+                f"{{ {depth}pc = t; goto dispatch; }} {slow}")
 
     def control(self, a, w):
         op = w >> 26
@@ -182,11 +202,11 @@ class FlatRegion:
             out.append("FLUSH();")
             if not link:
                 out.append("if (t == stop && depth == 0) FINISH();")
-                out.append("rt_flat_nonlocal(t);")
-                out.append(f"pc = rt_flat_transfer(c, t, {ret:#010x}u, 0, stop, &depth); goto dispatch;")
+                # returns to an outer native frame longjmp there: registers must be in c->r
+                out.append("if (rt_flat_nonlocal_needed(t)) { SPILL(); rt_flat_nonlocal(t); }")
             else:
-                out.append("CHECK_EVENTS(c);")
-                out.append(f"pc = rt_flat_transfer(c, t, {ret:#010x}u, 1, stop, &depth); goto dispatch;")
+                out.append("CHK();")
+            out.append(self.xfer("t", ret, link))
             return " ".join(out)
         if op in (0x02, 0x03):  # j / jal
             t = ((a + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
@@ -197,10 +217,10 @@ class FlatRegion:
             out.append(self.delay(a))
             out.append("FLUSH();")
             if jal or t <= a:
-                out.append("CHECK_EVENTS(c);")
-            else:
-                out.append(f"if (rt_is_func_entry({t:#010x}u)) CHECK_EVENTS(c);")
-            out.append(f"pc = rt_flat_transfer(c, {t:#010x}u, {ret:#010x}u, {1 if jal else 0}, stop, &depth); goto dispatch;")
+                out.append("CHK();")
+            elif not self.in_region(t):  # (no function entries inside the regions)
+                out.append(f"if (rt_is_func_entry({t:#010x}u)) CHK();")
+            out.append(self.xfer(t, ret, jal))
             return " ".join(out)
         # conditional branches: the condition is read before the delay slot runs
         simm = s16(w & 0xFFFF)
@@ -223,10 +243,11 @@ class FlatRegion:
         out.append(self.delay(a))
         out.append(f"if (!taken) {self.goto(ret)}")
         if link:
-            out.append(f"FLUSH(); CHECK_EVENTS(c); pc = rt_flat_transfer(c, {target:#010x}u, {ret:#010x}u, 1, stop, &depth); goto dispatch;")
+            out.append("FLUSH(); CHK();")
+            out.append(self.xfer(target, ret, True))
         else:
             if target <= a:
-                out.append("FLUSH(); CHECK_EVENTS(c);")
+                out.append("FLUSH(); CHK();")
             out.append(self.goto(target))
         return " ".join(out)
 
@@ -236,11 +257,36 @@ class FlatRegion:
         self.clo = self.lo + ci * CHUNK * 4
         self.chi = min(self.hi, self.clo + CHUNK * 4)
         n = (self.chi - self.clo) >> 2
+        # instruction bodies first: the register set the chunk uses decides its prologue
+        reg_ref = re.compile(r"\br\[(\d+)\]")
+        lines = []
+        for k in range(n):
+            a = self.clo + 4 * k
+            w = self.word(a)
+            lines.append(f"L_{a:08X}:")
+            lines.append(f"    if (sic && stop == {a:#010x}u) {{ if (depth == 0) FINISH(); depth--; }}")
+            body = self.control(a, w) if is_control(w) else simple(w, a)
+            pc_set = f"c->pc = {a:#010x}u; " if is_control(w) else ""
+            lines.append(reg_ref.sub(r"R\1", f"    {pc_set}n += {insn_cycles(w)}; {body}"))
+        text = "\n".join(lines)
+        used = sorted({int(m) for m in re.findall(r"\bR(\d+)\b", text)} - {0})
+        written = sorted({int(m) for m in re.findall(r"\bR(\d+) = ", text)} - {0})
+
         o = []
         o.append(f"static uint32_t {self.name}_{ci}(CPU* c, uint32_t pc, uint32_t stop, int* dp, int* done) {{")
-        o.append("    uint32_t* r = c->r;")
         o.append("    int depth = *dp;")
         o.append("    uint32_t t; int taken; (void)t; (void)taken;")
+        # The MIPS registers this chunk uses live in locals so the compiler can keep them in
+        # host registers: c->r would have to be reloaded after every store, since any store
+        # may alias it. The ones it writes go back to c->r (SPILL) before anything that can
+        # look at or change c->r - calls, events, fallback instructions, longjmps, leaving
+        # the chunk - and all of them are read again (RELOAD) after it.
+        o.append("    const uint32_t R0 = 0; (void)R0;")
+        if used:
+            o.append("    uint32_t " + ", ".join(f"R{k} = c->r[{k}]" for k in used) + ";")
+        o.append("#define SPILL() do { " + " ".join(f"c->r[{k}] = R{k};" for k in written) + " } while (0)")
+        o.append("#define RELOAD() do { " + " ".join(f"R{k} = c->r[{k}];" for k in used) + " } while (0)")
+        o.append("#define CHK() do { if (c->cycles >= c->next_event) { SPILL(); rt_check_events(c); RELOAD(); } } while (0)")
         # Cycles are counted in n and added to c->cycles (FLUSH) only where something can look
         # at them: hardware accesses, event checks, calls, leaving the chunk. Adding the same
         # total in one step gives the same result as interp_run's per-instruction rt_cyc.
@@ -248,16 +294,9 @@ class FlatRegion:
         # the stop address can only match inside this chunk if it lies in it
         o.append(f"    const int sic = stop - {self.clo:#010x}u < {self.chi - self.clo:#x}u;")
         o.append("#define FLUSH() do { if (n) { rt_cyc(c, n); n = 0; } } while (0)")
-        o.append("#define FINISH() do { FLUSH(); *dp = depth; *done = 1; return 0; } while (0)")
+        o.append("#define FINISH() do { FLUSH(); SPILL(); *dp = depth; *done = 1; return 0; } while (0)")
         o.append("    goto dispatch;")
-        for k in range(n):
-            a = self.clo + 4 * k
-            w = self.word(a)
-            o.append(f"L_{a:08X}:")
-            o.append(f"    if (sic && stop == {a:#010x}u) {{ if (depth == 0) FINISH(); depth--; }}")
-            body = self.control(a, w) if is_control(w) else simple(w, a)
-            pc_set = f"c->pc = {a:#010x}u; " if is_control(w) else ""
-            o.append(f"    {pc_set}n += {insn_cycles(w)}; {body}")
+        o.append(text)
         o.append(f"    pc = {self.chi:#010x}u;")
         o.append("dispatch:")
         o.append(f"    if (pc - {self.clo:#010x}u < {self.chi - self.clo:#x}u && !(pc & 3)) {{")
@@ -266,9 +305,12 @@ class FlatRegion:
             o.append(f"        case {k}: goto L_{self.clo + 4 * k:08X};")
         o.append("        }")
         o.append("    }")
-        o.append("    FLUSH(); *dp = depth; *done = 0; return pc;")
+        o.append("    FLUSH(); SPILL(); *dp = depth; *done = 0; return pc;")
         o.append("#undef FINISH")
         o.append("#undef FLUSH")
+        o.append("#undef CHK")
+        o.append("#undef RELOAD")
+        o.append("#undef SPILL")
         o.append("}")
         return "\n".join(o)
 
