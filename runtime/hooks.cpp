@@ -15,6 +15,52 @@
 
 int g_hooks_on = 0;
 uint32_t g_cyc_scale = 256;
+int g_idle_skip = 1;
+
+// Idle loops. MainFrame_RenderFrame (F_80035E70) waits for the frame to finish in a loop that
+// only reads RAM (gGT = [gp+0x340]):
+//   L_80037894: v1 = gGT; v0 = gGT->[0x1ce0]; if (v0 >= 7) leave        CYC(15)
+//               v0 = byte gGT->[0x1d30]                                     CYC(5)
+//               if (v0 != 0) { event check; again }                         CYC(3)   = 23
+//               v0 = [gp+0x348]; if ((int)v0 > 0) { event check; again }    CYC(8)   = 31
+// Nothing it reads can change until an event runs, so every pass until the one whose event
+// check fires is identical: charge their cycles in one step and let that last pass run. The
+// cycle counts must match the code gen/recomp.py emits for the loop (see the comment above).
+void rt_idle_skip(CPU* c, uint32_t pc, uint32_t gp) {
+    if (!g_idle_skip || pc != 0x80037894u) return;
+    uint32_t a = gp + 0x340;
+    if (!FLAT_FAST(a)) return;
+    uint32_t gt = MEM_LW(a);
+    if (!FLAT_FAST(gt + 0x1ce0) || !FLAT_FAST(gp + 0x348)) return;
+    if (MEM_LW(gt + 0x1ce0) >= 7) return;  // this pass leaves the loop
+    uint32_t per_pass;
+    if (MEM_LB(gt + 0x1d30) != 0) per_pass = 23;
+    else if ((int32_t)MEM_LW(gp + 0x348) > 0) per_pass = 31;
+    else return;  // this pass leaves the loop
+    // count the passes whose event check would not fire (cycles still below next_event)
+    int64_t cycles = c->cycles;
+    uint32_t frac = c->cyc_frac;
+    uint64_t skipped = 0;
+    for (;;) {
+        int64_t cy = cycles;
+        uint32_t fr = frac;
+        if (g_cyc_scale == 256) {
+            cy += per_pass;
+        } else {
+            uint32_t t = fr + per_pass * g_cyc_scale;
+            cy += t >> 8;
+            fr = t & 255;
+        }
+        if (cy >= c->next_event) break;  // this pass's event check fires: run it normally
+        cycles = cy;
+        frac = fr;
+        skipped++;
+    }
+    if (skipped) {
+        c->cycles = cycles;
+        c->cyc_frac = frac;
+    }
+}
 static int32_t k_x1000 = 1000;    // projection X scale, 1/1000 units
 static int32_t far_x1000 = 1000;  // far-clip multiplier, 1/1000 units
 static double cur_aspect = 4.0 / 3.0;

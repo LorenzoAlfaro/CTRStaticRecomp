@@ -38,6 +38,10 @@ UNWIND_RESUME_FASTRET = 0x80071694
 # Enhancement hooks: rt_hook(c, addr) runs before these instructions when g_hooks_on is set
 # (runtime/hooks.cpp; widescreen patches in PushBuffer_SetMatrixVP / PushBuffer_UpdateFrustum).
 HOOKS = {0x80042E34, 0x80043170, 0x80043280}
+# Idle loops: rt_idle_skip(c, addr, gp) runs at their head and fast-forwards the cycles of
+# passes that only poll RAM until the next event (runtime/hooks.cpp; exact, so output is
+# unchanged). 0x80037894: MainFrame_RenderFrame waiting for the frame to finish.
+IDLE_LOOPS = {0x80037894}
 INTERP_ONLY_MAIN = [(0x80069BB0, 0x800715E8)]  # DrawSky .. RenderBucket_* .. TRIG_* (render asm)
 INTERP_ONLY_OVERLAYS = {226, 227, 228, 229}      # per-player-count level renderers
 # experiments: RECOMP_NO_INTERP_ONLY=1 recompiles all of the asm, =main only the main-executable part
@@ -749,6 +753,8 @@ class Emitter:
                 fn.labels.add(a + 4)
                 prev = a
                 continue
+            if a in IDLE_LOOPS and self.mod.name == "main":
+                self.line(f"rt_idle_skip(c, {a:#x}u, c->r[28]);")
             if a in HOOKS and self.mod.name == "main":
                 self.line(f"if (g_hooks_on) {{ SPILL(); rt_hook(c, {a:#x}u); RELOAD(); }}")
             self.pending += cycles(i) if i.valid else 1

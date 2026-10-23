@@ -589,6 +589,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--profile")) profile = true;
+        else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
         else if (!strcmp(argv[i], "--pc-sample") && i + 2 < argc) {
             pc_sample_from = strtoull(argv[++i], nullptr, 10);
             pc_sample_to = strtoull(argv[++i], nullptr, 10);

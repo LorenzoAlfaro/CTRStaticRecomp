@@ -238,6 +238,9 @@ int rt_is_func_entry(uint32_t t);
 extern int g_hooks_on;
 void rt_hook(CPU* c, uint32_t pc);
 int rt_is_hook(uint32_t pc);
+// Idle-loop fast-forward (hooks.cpp), emitted at the heads of gen/recomp.py IDLE_LOOPS.
+extern int g_idle_skip;
+void rt_idle_skip(CPU* c, uint32_t pc, uint32_t gp);
 
 uint32_t rt_mfc0(CPU* c, int reg);
 void rt_mtc0(CPU* c, int reg, uint32_t v);
