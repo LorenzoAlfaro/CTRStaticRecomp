@@ -459,6 +459,7 @@ void frontend_vblank() {
                  p_conv * 1000 / 300, p_present * 1000 / 300, g_gpu_stalls / 300.0, (unsigned long long)g_gpu_stall_why[1],
                  (unsigned long long)g_gpu_stall_why[2], (unsigned long long)g_gpu_stall_why[3]);
             memset(g_gpu_stall_why, 0, sizeof g_gpu_stall_why);
+            LOGI("profile: spu %.2f ms/frame (%s)", g_spu_ns.exchange(0) / 1e6 / 300, g_spu_thread ? "audio thread" : "inline");
             LOGI("profile: gpu sync wait %.2f ms/frame (incl. vblank), queue full %.2f ms/frame, vram copies %.1f/frame",
                  g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
             // the game's own frame rate: display buffer flips per 300 vblanks (emulated time)
@@ -485,6 +486,8 @@ void frontend_vblank() {
         frontend_poll_input();
         if (g_quit) {
             pc_sampler_report();
+            spu_flush();
+            if (g_audio_dump) fclose(g_audio_dump);
             bios_flush_cards();
             SDL_Quit();
             fflush(stderr);
@@ -598,7 +601,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--profile")) profile = true;
+        else if (!strcmp(argv[i], "--audio-dump") && i + 1 < argc) g_audio_dump = fopen(argv[++i], "wb");
         else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
+        else if (!strcmp(argv[i], "--no-spu-thread")) g_spu_thread = false;
         else if (!strcmp(argv[i], "--pc-sample") && i + 2 < argc) {
             pc_sample_from = strtoull(argv[++i], nullptr, 10);
             pc_sample_to = strtoull(argv[++i], nullptr, 10);
@@ -682,6 +687,7 @@ int main(int argc, char** argv) {
     if (audio_dev) SDL_PauseAudioDevice(audio_dev, 0);
     for (int i = 0; i < SDL_NumJoysticks(); i++) open_device(i);
 
+    g_spu_profile = profile;
     pc_sampler_start();
     hw_init();
     cpu_init();

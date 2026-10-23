@@ -1,14 +1,30 @@
 // SPU: 24 ADPCM voices, ADSR, noise, pitch modulation, reverb, CD input, capture + IRQ.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "psx.h"
 
 namespace psx {
 
+bool g_spu_profile = false;
+std::atomic<int64_t> g_spu_ns{0};
+FILE* g_audio_dump = nullptr;
+bool g_spu_thread = true;
+
 static uint8_t spu_ram[512 * 1024];
-static uint16_t regs[0x200];  // raw register file (offsets 0..0x3FF / 2)
+static uint16_t regs[0x200];   // raw register file (offsets 0..0x3FF / 2), as the mixer sees it
+static uint16_t mregs[0x200];  // the same as the CPU wrote it (CPU side)
+static bool threaded = false;  // mixing on the audio thread (see below)
+static uint32_t mix_irq_addr = 0;
+static void probe_irq(uint32_t addr);
+static void irq_hit(uint32_t addr);
 
 static inline int16_t ram16(uint32_t a) { return *(int16_t*)(spu_ram + (a & 0x7FFFE)); }
 static inline void ram16_set(uint32_t a, int16_t v) { *(int16_t*)(spu_ram + (a & 0x7FFFE)) = v; }
@@ -52,12 +68,10 @@ static std::vector<int16_t> out_buf;
 static inline uint16_t reg(uint32_t off) { return regs[off >> 1]; }
 static inline uint16_t spucnt() { return reg(0x1AA); }
 
-static void check_irq(uint32_t addr) {
-    if (!(spucnt() & 0x40) || irq_flag) return;
-    if ((addr & 0x7FFF8) == (irq_addr & 0x7FFF8)) {
-        irq_flag = true;
-        irq_raise(IRQ_SPU);
-    }
+// IRQ check for the mixer's own SPU RAM accesses
+static inline void check_irq(uint32_t addr) {
+    if (threaded) probe_irq(addr);
+    else irq_hit(addr);
 }
 
 // ---- ADPCM ----------------------------------------------------------------------------------
@@ -87,6 +101,7 @@ static void decode_block(Voice& v) {
 static void adsr_tick(int vi) {
     Voice& v = voices[vi];
     if (v.phase == OFF) return;
+    if (v.adsr_wait > 0) { v.adsr_wait--; return; }
     uint32_t lo = reg(vi * 16 + 8), hi = reg(vi * 16 + 10);
     bool exp = false, dec = false;
     int shift = 0, step = 0;
@@ -106,7 +121,6 @@ static void adsr_tick(int vi) {
         break;
     default: break;
     }
-    if (v.adsr_wait > 0) { v.adsr_wait--; return; }
     int cycles = 1 << std::max(0, shift - 11);
     int32_t s = step << std::max(0, 11 - shift);
     if (exp && !dec && v.level > 0x6000) cycles *= 4;
@@ -153,17 +167,18 @@ static inline int32_t fixed_vol(uint16_t r) {
 
 // ---- reverb ---------------------------------------------------------------------------------
 static inline int16_t sat16(int32_t v) { return (int16_t)std::clamp(v, -32768, 32767); }
-static uint32_t rv_addr(uint32_t off) {
-    uint32_t base = (uint32_t)reg(0x1A2) * 8;
+// reverb work area: base address (mBASE) to the end of SPU RAM, read once per step
+static uint32_t rv_base, rv_size;
+static bool rv_writes;
+static inline uint32_t rv_addr(uint32_t off) {
     uint32_t a = reverb_addr + off;
-    uint32_t size = 0x80000 - base;
-    if (size == 0) return base;
-    while (a >= 0x80000) a = base + (a - 0x80000) % size;
+    if (rv_size == 0) return rv_base;
+    while (a >= 0x80000) a = rv_base + (a - 0x80000) % rv_size;
     return a & 0x7FFFE;
 }
 static inline int16_t rv_read(uint32_t off, int32_t delta = 0) { return ram16(rv_addr((off + (uint32_t)delta) & 0x7FFFF)); }
 static inline void rv_write(uint32_t off, int32_t v) {
-    if (spucnt() & 0x80) {
+    if (rv_writes) {
         uint32_t a = rv_addr(off);
         check_irq(a);
         ram16_set(a, sat16(v));
@@ -171,6 +186,9 @@ static inline void rv_write(uint32_t off, int32_t v) {
 }
 
 static void reverb_step(int32_t in_l, int32_t in_r) {
+    rv_base = (uint32_t)reg(0x1A2) * 8;
+    rv_size = 0x80000 - rv_base;
+    rv_writes = spucnt() & 0x80;
     auto R = [](int i) { return (int32_t)(int16_t)regs[(0x1C0 >> 1) + i]; };
     auto A = [](int i) { return (uint32_t)regs[(0x1C0 >> 1) + i] * 8; };
     int32_t dAPF1 = (int32_t)A(0), dAPF2 = (int32_t)A(1);
@@ -242,13 +260,9 @@ static void sample_tick() {
             continue;
         }
         if (!v.block_valid) decode_block(v);
-        int idx = v.counter >> 12;
+        int idx = v.counter >> 12;  // 0..27: the advance below keeps it inside the block
         int frac = (v.counter >> 4) & 0xFF;
-        auto sample_at = [&](int i) -> int32_t {
-            if (i >= 0) return v.decoded[std::min(i, 27)];
-            return v.prev[3 + i];
-        };
-        int32_t s0 = sample_at(idx), s1 = sample_at(idx + 1 <= 27 ? idx + 1 : 27);
+        int32_t s0 = v.decoded[idx], s1 = v.decoded[idx < 27 ? idx + 1 : 27];
         int32_t s = s0 + (((s1 - s0) * frac) >> 8);
         if (non & (1u << vi)) s = (int16_t)noise_level;
         s = (s * v.level) >> 15;
@@ -294,17 +308,20 @@ static void sample_tick() {
     if (cd_rd != cd_wr) {
         cd_l = cd_buf[cd_rd];
         cd_r = cd_buf[cd_rd + 1];
-        cd_rd = (cd_rd + 2) % cd_buf.size();
+        cd_rd += 2;
+        if (cd_rd == cd_buf.size()) cd_rd = 0;
     }
     // capture buffers (CD L/R, voice 1, voice 3)
     ram16_set(0x000 + capture_pos * 2, (int16_t)cd_l);
     ram16_set(0x400 + capture_pos * 2, (int16_t)cd_r);
     ram16_set(0x800 + capture_pos * 2, voice_out[1]);
     ram16_set(0xC00 + capture_pos * 2, voice_out[3]);
-    check_irq(0x000 + capture_pos * 2);
-    check_irq(0x400 + capture_pos * 2);
-    check_irq(0x800 + capture_pos * 2);
-    check_irq(0xC00 + capture_pos * 2);
+    if (!threaded) {  // otherwise checked on the CPU side (spu_run_until)
+        irq_hit(0x000 + capture_pos * 2);
+        irq_hit(0x400 + capture_pos * 2);
+        irq_hit(0x800 + capture_pos * 2);
+        irq_hit(0xC00 + capture_pos * 2);
+    }
     capture_pos = (capture_pos + 1) & 0x1FF;
     if (cnt & 1) {
         int32_t cl = (cd_l * (int16_t)reg(0x1B0)) >> 15, cr = (cd_r * (int16_t)reg(0x1B2)) >> 15;
@@ -337,95 +354,61 @@ static void sample_tick() {
         }
     }
     if (out_buf.size() >= 1024) {
+        if (g_audio_dump) fwrite(out_buf.data(), 2, out_buf.size(), g_audio_dump);
         frontend_audio(out_buf.data(), (int)out_buf.size() / 2);
         out_buf.clear();
     }
 }
 
-void spu_run_until(int64_t cycles) {
-    int64_t delta = cycles - last_cycles;
-    if (delta <= 0) return;
-    last_cycles = cycles;
-    cycle_accum += delta;
-    while (cycle_accum >= 768) {
-        cycle_accum -= 768;
-        sample_tick();
-    }
+
+// ---- audio thread -----------------------------------------------------------------------------
+// With the audio thread on, the CPU side (main thread) keeps only what the game can observe
+// without the mixer: the register file as written, the sample clock, the capture position and
+// the IRQ (CTR points it at the capture buffer, whose position follows the clock alone). The
+// mixer runs behind on its own thread: each register / SPU RAM / CD input write is queued
+// with the sample count at which it happened and applied between the same two samples as
+// when mixing inline, so the output is identical. Reads of mixer state (voice registers,
+// ENDX, voice output) and SPU RAM DMA reads wait for the mixer to catch up first.
+// IRQ hits from the mixer's own accesses (voice blocks, reverb writes) can't be delivered at
+// the right moment from the audio thread; they are counted and reported (none in CTR).
+static uint64_t m_samples = 0;     // samples elapsed (CPU side)
+static uint32_t m_capture_pos = 0;  // capture position (CPU side)
+
+enum CmdKind { CMD_REG, CMD_RAM16, CMD_DMA, CMD_CD };
+struct Cmd {
+    uint64_t at;  // apply after this many samples
+    CmdKind kind;
+    uint32_t a, b;
+    std::vector<int16_t> data;
+};
+static std::mutex mu;
+static std::condition_variable cv_work, cv_idle;
+static std::deque<Cmd> cmds;
+static uint64_t target = 0, w_samples = 0;  // under mu
+static bool w_waiting = false;
+static std::atomic<uint64_t> probe_hits{0};
+
+static void probe_irq(uint32_t addr) {
+    if ((spucnt() & 0x40) && (addr & 0x7FFF8) == (mix_irq_addr & 0x7FFF8) &&
+        probe_hits.fetch_add(1, std::memory_order_relaxed) == 0)
+        LOGW("SPU: IRQ address %05x hit by the mixer on the audio thread; its timing may be off (use --no-spu-thread)",
+             mix_irq_addr);
 }
 
-static void ev_spu(int64_t t) {
-    spu_run_until(t);
-    schedule(EV_SPU, t + 768 * 32);
-}
-
-// ---- register interface --------------------------------------------------------------------
-uint16_t spu_read16(uint32_t off) {
-    spu_run_until(now());
-    off &= 0x3FE;
-    if (off == 0x19C) return (uint16_t)endx;
-    if (off == 0x19E) return (uint16_t)(endx >> 16);
-    if (off == 0x1AE) {
-        uint16_t cnt = spucnt();
-        uint16_t s = cnt & 0x3F;
-        if (irq_flag) s |= 0x40;
-        uint32_t mode = (cnt >> 4) & 3;
-        if (mode == 2) s |= 0x80 | 0x100;
-        if (mode == 3) s |= 0x80 | 0x200;
-        if (capture_pos >= 0x100) s |= 0x800;
-        return s;
-    }
-    if (off == 0x1A8) return 0;
-    if (off >= 0x200 && off < 0x260) {
-        int vi = (off - 0x200) / 4;
-        return (uint16_t)((voices[vi].last_out));
-    }
-    return reg(off);
-}
-
-void spu_write16(uint32_t off, uint16_t v) {
-    spu_run_until(now());
-    off &= 0x3FE;
+static void mixer_write(uint32_t off, uint16_t v) {
     regs[off >> 1] = v;
     switch (off) {
     case 0x188: for (int i = 0; i < 16; i++) if (v & (1 << i)) key_on(i); break;
     case 0x18A: for (int i = 0; i < 8; i++) if (v & (1 << i)) key_on(16 + i); break;
     case 0x18C: for (int i = 0; i < 16; i++) if (v & (1 << i)) key_off(i); break;
     case 0x18E: for (int i = 0; i < 8; i++) if (v & (1 << i)) key_off(16 + i); break;
-    case 0x19C: case 0x19E: break;
     case 0x1A2: reverb_addr = (uint32_t)v * 8; break;
-    case 0x1A4: irq_addr = (uint32_t)v * 8; break;
-    case 0x1A6: transfer_addr = (uint32_t)v * 8; break;
-    case 0x1A8:
-        check_irq(transfer_addr);
-        ram16_set(transfer_addr, (int16_t)v);
-        transfer_addr = (transfer_addr + 2) & 0x7FFFF;
-        break;
-    case 0x1AA:
-        if (!(v & 0x40)) irq_flag = false;
-        break;
+    case 0x1A4: mix_irq_addr = (uint32_t)v * 8; break;
     default: break;
     }
 }
 
-void spu_dma_write(const uint32_t* src, int words) {
-    spu_run_until(now());
-    for (int i = 0; i < words; i++) {
-        check_irq(transfer_addr);
-        ram16_set(transfer_addr, (int16_t)src[i]);
-        ram16_set(transfer_addr + 2, (int16_t)(src[i] >> 16));
-        transfer_addr = (transfer_addr + 4) & 0x7FFFF;
-    }
-}
-
-void spu_dma_read(uint32_t* dst, int words) {
-    for (int i = 0; i < words; i++) {
-        check_irq(transfer_addr);
-        dst[i] = (uint16_t)ram16(transfer_addr) | ((uint32_t)(uint16_t)ram16(transfer_addr + 2) << 16);
-        transfer_addr = (transfer_addr + 4) & 0x7FFFF;
-    }
-}
-
-void spu_cd_audio(const int16_t* stereo, int frames, int rate) {
+static void cd_push(const int16_t* stereo, int frames, int rate) {
     // resample to 44.1 kHz (linear) into the ring buffer
     double step = (double)rate / 44100.0;
     static int16_t last_l = 0, last_r = 0;
@@ -447,11 +430,196 @@ void spu_cd_audio(const int16_t* stereo, int frames, int rate) {
     last_r = stereo[2 * (frames - 1) + 1];
 }
 
+static void apply(const Cmd& c) {
+    switch (c.kind) {
+    case CMD_REG: mixer_write(c.a, (uint16_t)c.b); break;
+    case CMD_RAM16: ram16_set(c.a, (int16_t)c.b); break;
+    case CMD_DMA: {
+        uint32_t a = c.a;
+        for (size_t i = 0; i < c.data.size(); i += 2) {
+            ram16_set(a, c.data[i]);
+            ram16_set(a + 2, c.data[i + 1]);
+            a = (a + 4) & 0x7FFFF;
+        }
+        break;
+    }
+    case CMD_CD: cd_push(c.data.data(), (int)c.data.size() / 2, (int)c.a); break;
+    }
+}
+
+static void post(Cmd&& c) {
+    if (!threaded) { apply(c); return; }
+    c.at = m_samples;
+    std::lock_guard<std::mutex> lk(mu);
+    cmds.push_back(std::move(c));
+}
+
+static void mix_samples(uint64_t n) {
+    auto t0 = g_spu_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    for (uint64_t i = 0; i < n; i++) sample_tick();
+    if (g_spu_profile)
+        g_spu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static void audio_thread() {
+    std::unique_lock<std::mutex> lk(mu);
+    for (;;) {
+        if (!cmds.empty() && cmds.front().at <= w_samples) {
+            Cmd c = std::move(cmds.front());
+            cmds.pop_front();
+            lk.unlock();
+            apply(c);
+            lk.lock();
+            continue;
+        }
+        uint64_t end = target;
+        if (!cmds.empty()) end = std::min(end, cmds.front().at);
+        if (w_samples < end) {
+            uint64_t n = end - w_samples;
+            lk.unlock();
+            mix_samples(n);
+            lk.lock();
+            w_samples += n;
+            continue;
+        }
+        w_waiting = true;
+        cv_idle.notify_all();
+        cv_work.wait(lk);
+        w_waiting = false;
+    }
+}
+
+// wait until the mixer has caught up with the CPU side
+static void drain() {
+    if (!threaded) return;
+    std::unique_lock<std::mutex> lk(mu);
+    cv_work.notify_one();
+    cv_idle.wait(lk, [] { return w_waiting && w_samples == target && cmds.empty(); });
+}
+void spu_flush() { drain(); }
+
+// CPU-side IRQ check (transfers; the capture buffer when the mixer is threaded)
+static void irq_hit(uint32_t addr) {
+    if (!(mregs[0x1AA >> 1] & 0x40) || irq_flag) return;
+    if ((addr & 0x7FFF8) == (irq_addr & 0x7FFF8)) {
+        irq_flag = true;
+        irq_raise(IRQ_SPU);
+    }
+}
+
+void spu_run_until(int64_t cycles) {
+    int64_t delta = cycles - last_cycles;
+    if (delta <= 0) return;
+    last_cycles = cycles;
+    cycle_accum += delta;
+    if (cycle_accum < 768) return;
+    uint64_t n = (uint64_t)(cycle_accum / 768);
+    cycle_accum -= (int64_t)n * 768;
+    if (!threaded) {
+        mix_samples(n);
+        m_samples += n;
+        m_capture_pos = (m_capture_pos + (uint32_t)n) & 0x1FF;
+        return;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t p = m_capture_pos * 2;
+        irq_hit(p);
+        irq_hit(0x400 + p);
+        irq_hit(0x800 + p);
+        irq_hit(0xC00 + p);
+        m_capture_pos = (m_capture_pos + 1) & 0x1FF;
+    }
+    m_samples += n;
+    std::lock_guard<std::mutex> lk(mu);
+    target = m_samples;
+    if (w_waiting && target - w_samples >= 256) cv_work.notify_one();  // wake in batches
+}
+
+static void ev_spu(int64_t t) {
+    spu_run_until(t);
+    schedule(EV_SPU, t + 768 * 32);
+}
+
+// ---- register interface --------------------------------------------------------------------
+uint16_t spu_read16(uint32_t off) {
+    spu_run_until(now());
+    off &= 0x3FE;
+    if (off < 0x180 || off == 0x19C || off == 0x19E || (off >= 0x200 && off < 0x260)) {
+        // mixer state: voice registers (envelope, repeat address), ENDX, voice output
+        drain();
+        if (off == 0x19C) return (uint16_t)endx;
+        if (off == 0x19E) return (uint16_t)(endx >> 16);
+        if (off >= 0x200) return (uint16_t)voices[(off - 0x200) / 4].last_out;
+        return reg(off);
+    }
+    if (off == 0x1AE) {
+        uint16_t cnt = mregs[0x1AA >> 1];
+        uint16_t s = cnt & 0x3F;
+        if (irq_flag) s |= 0x40;
+        uint32_t mode = (cnt >> 4) & 3;
+        if (mode == 2) s |= 0x80 | 0x100;
+        if (mode == 3) s |= 0x80 | 0x200;
+        if (m_capture_pos >= 0x100) s |= 0x800;
+        return s;
+    }
+    if (off == 0x1A8) return 0;
+    return mregs[off >> 1];
+}
+
+void spu_write16(uint32_t off, uint16_t v) {
+    spu_run_until(now());
+    off &= 0x3FE;
+    mregs[off >> 1] = v;
+    switch (off) {
+    case 0x1A4: irq_addr = (uint32_t)v * 8; break;
+    case 0x1A6: transfer_addr = (uint32_t)v * 8; break;
+    case 0x1A8:
+        irq_hit(transfer_addr);
+        post({0, CMD_RAM16, transfer_addr, v, {}});
+        transfer_addr = (transfer_addr + 2) & 0x7FFFF;
+        break;
+    case 0x1AA:
+        if (!(v & 0x40)) irq_flag = false;
+        break;
+    default: break;
+    }
+    post({0, CMD_REG, off, v, {}});
+}
+
+void spu_dma_write(const uint32_t* src, int words) {
+    spu_run_until(now());
+    Cmd c{0, CMD_DMA, transfer_addr, 0, std::vector<int16_t>((size_t)words * 2)};
+    for (int i = 0; i < words; i++) {
+        irq_hit(transfer_addr);
+        c.data[2 * i] = (int16_t)src[i];
+        c.data[2 * i + 1] = (int16_t)(src[i] >> 16);
+        transfer_addr = (transfer_addr + 4) & 0x7FFFF;
+    }
+    post(std::move(c));
+}
+
+void spu_dma_read(uint32_t* dst, int words) {
+    drain();
+    for (int i = 0; i < words; i++) {
+        irq_hit(transfer_addr);
+        dst[i] = (uint16_t)ram16(transfer_addr) | ((uint32_t)(uint16_t)ram16(transfer_addr + 2) << 16);
+        transfer_addr = (transfer_addr + 4) & 0x7FFFF;
+    }
+}
+
+void spu_cd_audio(const int16_t* stereo, int frames, int rate) {
+    post({0, CMD_CD, (uint32_t)rate, 0, std::vector<int16_t>(stereo, stereo + (size_t)frames * 2)});
+}
+
 void spu_init() {
     memset(spu_ram, 0, sizeof spu_ram);
     memset(regs, 0, sizeof regs);
+    memset(mregs, 0, sizeof mregs);
     register_event(EV_SPU, ev_spu);
     schedule(EV_SPU, 768 * 32);
+    threaded = g_spu_thread && std::thread::hardware_concurrency() >= 4;
+    if (threaded) std::thread(audio_thread).detach();
+    LOGI("SPU: mixing on %s", threaded ? "its own thread" : "the CPU thread");
 }
 
 }  // namespace psx

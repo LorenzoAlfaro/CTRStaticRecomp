@@ -1,6 +1,7 @@
 // Internal runtime interfaces (C++ only).
 #pragma once
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <string>
 
@@ -109,6 +110,11 @@ void spu_dma_write(const uint32_t* src, int words);
 void spu_dma_read(uint32_t* dst, int words);
 void spu_cd_audio(const int16_t* stereo, int frames, int rate);  // XA / CDDA input
 void spu_run_until(int64_t cycles);
+extern bool g_spu_profile;   // time the mixing (--profile)
+extern std::atomic<int64_t> g_spu_ns;
+extern bool g_spu_thread;     // mix on an audio thread (--no-spu-thread: inline)
+void spu_flush();             // wait for the audio thread to catch up
+extern FILE* g_audio_dump;   // --audio-dump: raw 44.1 kHz stereo s16 output
 
 // ---- CD-ROM -------------------------------------------------------------------------
 bool cd_open(const std::string& path);
