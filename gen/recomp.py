@@ -627,6 +627,11 @@ def emit_simple(i):
 
 
 PRECISE = os.environ.get("RECOMP_PRECISE") == "1"  # per-instruction cycle updates (lockstep debugging)
+# MIPS registers in C locals (see Emitter.finish); off for precise/tracing builds
+REGCACHE = not PRECISE and os.environ.get("RECOMP_NO_REGCACHE") != "1"
+# simple instructions that reach the runtime and may read or change c->r (none of them writes a
+# register itself: mfc0 only reads COP0, and wrapping it would RELOAD over its result)
+CALL_LIKE = ("rt_syscall", "rt_mtc0", "rt_rfe", "rt_break")
 
 
 class Emitter:
@@ -671,17 +676,23 @@ class Emitter:
             return f"{mod.fname(target)}(c); return;"
         return f"rt_jump(c, {target:#x}u, ra_entry); return;"
 
+    def simple(self, i, ind=1):
+        code = emit_simple(i)
+        if any(k in code for k in CALL_LIKE):
+            code = f"SPILL(); {code} RELOAD();"
+        self.line(code, ind)
+
     def delay(self, a, ind):
         d = self.fn.insns.get(a + 4)
         if PRECISE:
             self.line(f"CYC({cycles(d) if d is not None and d.valid else 1});", ind)
         if d is not None and d.word != 0:
             if not d.valid:
-                self.line(f"rt_invalid(c, {a + 4:#x}u);", ind)
+                self.line(f"SPILL(); rt_invalid(c, {a + 4:#x}u);", ind)
             elif d.has_delay:
                 self.line(f"/* branch in delay slot at {a + 4:08x} */ rt_warn_delay(c, {a + 4:#x}u);", ind)
             else:
-                self.line(emit_simple(d), ind)
+                self.simple(d, ind)
 
     def run(self):
         fn, mod = self.fn, self.mod
@@ -700,6 +711,7 @@ class Emitter:
             self.out.append(f"static void {name}_body(CPU* c) {{")
         else:
             self.out.append(f"void {name}(CPU* c) {{")
+        self.body_start = len(self.out) - 1
         self.line("uint32_t ra_entry = c->r[31]; (void)ra_entry;")
         if PRECISE:
             self.line(f"TRACE_ENTRY(c, {fn.entry:#x}u);")
@@ -720,7 +732,7 @@ class Emitter:
             if prev is not None and a != prev + 4 and not self.terminated:
                 # gap: previous instruction falls through to an address we don't have
                 self.flush_cycles()
-                self.line(f"rt_fallthrough(c, {prev + 4:#x}u); return;")
+                self.line(f"SPILL(); rt_fallthrough(c, {prev + 4:#x}u); return;")
             if a in fn.labels:
                 self.flush_cycles()
                 self.out.append(f"L_{a:08X}:;")
@@ -729,19 +741,22 @@ class Emitter:
                 # branch target inside a delay slot: execute it then continue at a+4
                 self.pending += cycles(i) if i.valid else 1
                 self.flush_cycles()
-                self.line(emit_simple(i) if i.valid else f"rt_invalid(c, {a:#x}u); return;")
+                if i.valid:
+                    self.simple(i)
+                else:
+                    self.line(f"SPILL(); rt_invalid(c, {a:#x}u); return;")
                 self.line(f"goto L_{a + 4:08X};")
                 fn.labels.add(a + 4)
                 prev = a
                 continue
             if a in HOOKS and self.mod.name == "main":
-                self.line(f"if (g_hooks_on) rt_hook(c, {a:#x}u);")
+                self.line(f"if (g_hooks_on) {{ SPILL(); rt_hook(c, {a:#x}u); RELOAD(); }}")
             self.pending += cycles(i) if i.valid else 1
             if PRECISE:
                 self.flush_cycles()
             if not i.valid:
                 self.flush_cycles()
-                self.line(f"rt_invalid(c, {a:#x}u); return;")
+                self.line(f"SPILL(); rt_invalid(c, {a:#x}u); return;")
                 self.terminated = True
             elif i.has_delay:
                 d = fn.insns.get(a + 4)
@@ -750,14 +765,51 @@ class Emitter:
                 self.control(i)
                 self.terminated = i.op in ("j", "jr") or is_uncond_branch(i)
             else:
-                self.line(emit_simple(i))
+                self.simple(i)
             prev = a if not i.has_delay else a + 4
         # the last instruction might fall off the end
         if not self.terminated:
             self.flush_cycles()
-            self.line(f"rt_fallthrough(c, {prev + 4:#x}u); return;")
+            self.line(f"SPILL(); rt_fallthrough(c, {prev + 4:#x}u); return;")
         self.out.append("}")
-        return "\n".join(self.out)
+        return self.finish()
+
+    def finish(self):
+        """Give the function body its register locals (REGCACHE), or plain c->r accesses.
+
+        CTR's code keeps working values in MIPS registers across many memory accesses; as
+        c->r[n] every one of them is reloaded after each store, since a store through g_ram
+        may alias c->r. As locals the compiler can keep them in host registers. The body
+        writes the registers it modified back to c->r (SPILL) before anything that reads
+        or changes c->r - calls, the runtime's call/jump/return helpers, interrupts, hooks,
+        syscalls, every exit - and re-reads the ones it uses (RELOAD) after calls."""
+        start = self.body_start
+        body = self.out[start + 1:-1]
+        rng = os.environ.get("RECOMP_REGCACHE_RANGE")  # debugging: "lo-hi" (hex) limits caching
+        in_range = True
+        if rng:
+            lo, hi = (int(x, 16) for x in rng.split("-"))
+            in_range = lo <= self.fn.entry < hi
+        if not REGCACHE or not in_range:
+            plain = []
+            for ln in body:
+                for a, b in (("SPILL(); ", ""), (" RELOAD();", ""), ("RELOAD(); ", ""), ("SPILL();", ""),
+                             ("RELOAD();", ""), ("CHK();", "CHECK_EVENTS(c);")):
+                    ln = ln.replace(a, b)
+                plain.append(ln)
+            return "\n".join(self.out[:start + 1] + plain + self.out[-1:])
+        text = "\n".join(body)
+        used = sorted({int(m) for m in re.findall(r"c->r\[(\d+)\]", text)} - {0})
+        written = sorted({int(m) for m in re.findall(r"c->r\[(\d+)\] = ", text)} - {0})
+        text = re.sub(r"c->r\[(\d+)\]", r"R\1", text)
+        head = []
+        if used:
+            head.append("    uint32_t " + ", ".join(f"R{k} = c->r[{k}]" for k in used) + ";")
+        head.append("#define SPILL() do { " + " ".join(f"c->r[{k}] = R{k};" for k in written) + " } while (0)")
+        head.append("#define RELOAD() do { " + " ".join(f"R{k} = c->r[{k}];" for k in used) + " } while (0)")
+        head.append("#define CHK() do { if (c->cycles >= c->next_event) { SPILL(); rt_check_events(c); RELOAD(); } } while (0)")
+        tail = ["#undef SPILL", "#undef RELOAD", "#undef CHK"]
+        return "\n".join(self.out[:start + 1] + head + [text] + tail + self.out[-1:])
 
     @staticmethod
     def ends_block(i, a):
@@ -783,7 +835,7 @@ class Emitter:
                 self.delay(a, 1)
                 self.flush_cycles()
                 if back:
-                    self.line("CHECK_EVENTS(c);")
+                    self.line("CHK();")
                 self.line(f"goto L_{i.target:08X};")
                 return
             self.line("{")
@@ -791,7 +843,7 @@ class Emitter:
             self.delay(a, 2)
             self.flush_cycles(2)
             if back:
-                self.line(f"if (cond) {{ CHECK_EVENTS(c); goto L_{i.target:08X}; }}", 2)
+                self.line(f"if (cond) {{ CHK(); goto L_{i.target:08X}; }}", 2)
             else:
                 self.line(f"if (cond) goto L_{i.target:08X};", 2)
             self.line("}")
@@ -806,15 +858,15 @@ class Emitter:
             self.line(f"c->r[31] = {a + 8:#x}u;", 2)
             self.delay(a, 2)
             self.flush_cycles(2)
-            self.line(f"if (cond) {{ CHECK_EVENTS(c); {self.call_expr(i.target, a + 8)} }}", 2)
+            self.line(f"if (cond) {{ CHK(); SPILL(); {self.call_expr(i.target, a + 8)} RELOAD(); }}", 2)
             self.line("}")
             return
         if op == "jal":
             self.line(f"c->r[31] = {a + 8:#x}u;")
             self.delay(a, 1)
             self.flush_cycles()
-            self.line("CHECK_EVENTS(c);")
-            self.line(f"{{ CALL_CHECK_BEGIN(); {self.call_expr(i.target, a + 8)} CALL_CHECK_END({i.target:#x}u, {a:#x}u); }}")
+            self.line("CHK();")
+            self.line(f"{{ SPILL(); CALL_CHECK_BEGIN(); {self.call_expr(i.target, a + 8)} CALL_CHECK_END({i.target:#x}u, {a:#x}u); RELOAD(); }}")
             return
         if op == "jalr":
             self.line("{")
@@ -823,12 +875,13 @@ class Emitter:
                 self.line(f"c->r[{i.rd}] = {a + 8:#x}u;", 2)
             self.delay(a, 2)
             self.flush_cycles(2)
-            self.line("CHECK_EVENTS(c);", 2)
+            self.line("CHK();", 2)
             if a == UNWIND_CALLSITE and self.mod.ovr is None:
-                self.line(f"if (rt_unwind_call(c, t, {a + 8:#x}u) == 2) goto L_{UNWIND_RESUME_FASTRET:08X};", 2)
+                self.line(f"SPILL(); int u = rt_unwind_call(c, t, {a + 8:#x}u); RELOAD();", 2)
+                self.line(f"if (u == 2) goto L_{UNWIND_RESUME_FASTRET:08X};", 2)
                 self.fn.labels.add(UNWIND_RESUME_FASTRET)
             else:
-                self.line(f"rt_call(c, t, {a + 8:#x}u);", 2)
+                self.line(f"SPILL(); rt_call(c, t, {a + 8:#x}u); RELOAD();", 2)
             self.line("}")
             return
         if op == "j":
@@ -837,17 +890,17 @@ class Emitter:
             self.flush_cycles()
             if t in fn.labels and (t == fn.entry or not (t in self.mod.seeds and t != fn.entry)) and t in fn.insns:
                 if t <= a:
-                    self.line("CHECK_EVENTS(c);")
+                    self.line("CHK();")
                 self.line(f"goto L_{t:08X};")
             else:
-                self.line("CHECK_EVENTS(c);")
-                self.line(self.tail_expr(t))
+                self.line("CHK();")
+                self.line("SPILL(); " + self.tail_expr(t))
             return
         if op == "jr":
             if i.rs == 31:
                 self.delay(a, 1)
                 self.flush_cycles()
-                self.line("if (c->r[31] != ra_entry) rt_return_to(c, c->r[31]);")
+                self.line("SPILL(); if (c->r[31] != ra_entry) rt_return_to(c, c->r[31]);")
                 self.line("return;")
                 return
             self.line("{")
@@ -859,7 +912,7 @@ class Emitter:
                 for tgt in sorted(set(fn.jumptables[a])):
                     self.line(f"case {tgt:#x}u: goto L_{tgt:08X};", 3)
                 self.line("}", 2)
-            self.line("rt_jump(c, t, ra_entry); return;", 2)
+            self.line("SPILL(); rt_jump(c, t, ra_entry); return;", 2)
             self.line("}")
             return
         raise ValueError(op)
