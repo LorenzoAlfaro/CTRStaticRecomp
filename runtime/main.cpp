@@ -417,12 +417,21 @@ void frontend_vblank() {
     if (redraw) {
         last_ww = ww; last_wh = wh; last_fw = frame_w; last_fh = frame_h; last_a = a;
         g_presents++;
-        gpu_sync();
-        t1 = now_seconds();
         SDL_Rect src = {0, 0, frame_w, frame_h};
         void* pixels;
         int pitch;
-        if (!shot_now && SDL_LockTexture(texture, &src, &pixels, &pitch) == 0) {
+        const uint32_t* flip_px;
+        int flip_w, flip_h;
+        if (gpu_flip_frame(&flip_px, &flip_w, &flip_h) && flip_w == frame_w && flip_h == frame_h) {
+            // converted by the render threads when the game flipped buffers
+            t1 = now_seconds();
+            if (shot_now) {
+                frame.assign(flip_px, flip_px + (size_t)frame_w * frame_h);
+                SDL_UpdateTexture(texture, &src, frame.data(), frame_w * 4);
+            } else {
+                SDL_UpdateTexture(texture, &src, flip_px, frame_w * 4);
+            }
+        } else if (gpu_sync(), t1 = now_seconds(), !shot_now && SDL_LockTexture(texture, &src, &pixels, &pitch) == 0) {
             convert_display((uint32_t*)pixels, pitch / 4, frame_w, frame_h);
             SDL_UnlockTexture(texture);
         } else {

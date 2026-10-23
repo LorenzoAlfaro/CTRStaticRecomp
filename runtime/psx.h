@@ -85,7 +85,8 @@ DisplayInfo gpu_display();
 const uint16_t* gpu_vram();  // internal resolution: (1024*scale) x (512*scale)
 uint16_t gpu_vram_native(int x, int y);
 void gpu_sync();  // finish queued rendering before reading VRAM
-bool gpu_take_display_dirty();  // displayed picture may have changed since the last call
+bool gpu_take_display_dirty();
+bool gpu_flip_frame(const uint32_t** pixels, int* w, int* h);  // frame converted at the last flip, if still current  // displayed picture may have changed since the last call
 extern uint64_t g_gpu_flips;
 void gpu_convert_display(uint32_t* dst, int pitch_px, int x, int y, int w, int h);
 int gpu_scale();

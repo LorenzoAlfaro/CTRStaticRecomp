@@ -726,15 +726,67 @@ static int texture_reads(const DrawCtx& d, int umin, int umax, int vmin, int vma
 // races CTR draws into the hidden buffer, so about every other refresh needs no conversion.
 static bool display_dirty = true;
 
+// Conversion at flip time: when the game shows a new buffer, its drawing is already queued, so
+// a conversion queued right behind it is done by the render threads early, while the game
+// draws the next frame; the frontend then waits for that job only, not for everything queued
+// since. Any later write to the displayed area or display setting change discards it.
+static bool flip_valid = false;
+static std::vector<uint32_t> flip_buf[2];
+static uint64_t flip_buf_job[2] = {0, 0};  // queue position after each buffer's conversion
+static int flip_cur = -1, flip_w = 0, flip_h = 0;
+
 static void touch_display(const Rgn& w) {
-    if (display_dirty) return;
+    if (display_dirty && !flip_valid) return;
     DisplayInfo d = gpu_display();
-    if (w.x1 > 1024 || w.y1 > 512 || d.x + d.w > 1024 || d.y + d.h > 512) {  // wraps: be conservative
-        display_dirty = true;
-        return;
-    }
     int dw = d.rgb24 ? d.w * 3 / 2 : d.w;
-    if (w.x0 < d.x + dw && w.x1 > d.x && w.y0 < d.y + d.h && w.y1 > d.y) display_dirty = true;
+    bool wraps = w.x1 > 1024 || w.y1 > 512 || d.x + d.w > 1024 || d.y + d.h > 512;  // be conservative
+    if (wraps || (w.x0 < d.x + dw && w.x1 > d.x && w.y0 < d.y + d.h && w.y1 > d.y)) {
+        display_dirty = true;
+        flip_valid = false;
+    }
+}
+
+static uint64_t min_done();
+static void wake_workers();
+
+static void flip_convert() {
+    flip_valid = false;
+    if (!threaded) return;
+    DisplayInfo d = gpu_display();
+    if (d.rgb24 || !d.enabled) return;
+    int b = flip_cur < 0 ? 0 : flip_cur ^ 1;
+    while (min_done() < flip_buf_job[b]) cpu_relax();  // its previous conversion (two flips ago)
+    int w = d.w << sh, h = d.h << sh;
+    if (flip_buf[b].size() < (size_t)w * h) flip_buf[b].resize((size_t)w * h);
+    Job j;
+    j.kind = JOB_CONVERT;
+    j.v[0].nx = d.x << sh;
+    j.v[0].ny = d.y << sh;
+    j.v[1].nx = w;
+    j.v[1].ny = h;
+    j.dst = flip_buf[b].data();
+    j.pitch = w;
+    submit(j);
+    flip_buf_job[b] = q_head.load(std::memory_order_relaxed);
+    flip_cur = b;
+    flip_w = w;
+    flip_h = h;
+    flip_valid = true;
+}
+
+// The displayed frame converted at the last flip, if nothing changed it since (waits for its
+// conversion job only).
+bool gpu_flip_frame(const uint32_t** pixels, int* w, int* h) {
+    if (!threaded || !flip_valid) return false;
+    uint64_t need = flip_buf_job[flip_cur];
+    if (min_done() < need) {
+        wake_workers();
+        while (min_done() < need) cpu_relax();
+    }
+    *pixels = flip_buf[flip_cur].data();
+    *w = flip_w;
+    *h = flip_h;
+    return true;
 }
 
 bool gpu_take_display_dirty() {
@@ -1070,6 +1122,7 @@ void gpu_write_gp0(uint32_t w) {
 void gpu_write_gp1(uint32_t v) {
     switch (v >> 24) {
     case 0x00:
+        flip_valid = false; display_dirty = true;
         cmd_len = 0; polyline = false; upload.active = download.active = false;
         display_disabled = true; dma_dir = 0; irq_flag = false;
         stat_texpage = 0; tex_disable = dither = draw_to_display = false;
@@ -1080,18 +1133,20 @@ void gpu_write_gp1(uint32_t v) {
         break;
     case 0x01: cmd_len = 0; polyline = false; upload.active = false; break;
     case 0x02: irq_flag = false; break;
-    case 0x03: display_dirty |= display_disabled != (bool)(v & 1); display_disabled = v & 1; break;
+    case 0x03: flip_valid = false; display_dirty |= display_disabled != (bool)(v & 1); display_disabled = v & 1; break;
     case 0x04: dma_dir = v & 3; break;
     case 0x05:
         if ((int)(v & 0x3FE) != disp_x || (int)((v >> 10) & 0x1FF) != disp_y) {
             g_gpu_flips++;  // game frame shown
             display_dirty = true;
+            disp_x = v & 0x3FE; disp_y = (v >> 10) & 0x1FF;
+            flip_convert();
         }
         disp_x = v & 0x3FE; disp_y = (v >> 10) & 0x1FF;
         break;
-    case 0x06: display_dirty |= (h_start | (h_end << 12)) != (int)(v & 0xFFFFFF); h_start = v & 0xFFF; h_end = (v >> 12) & 0xFFF; break;
-    case 0x07: display_dirty |= (v_start | (v_end << 10)) != (int)(v & 0xFFFFF); v_start = v & 0x3FF; v_end = (v >> 10) & 0x3FF; break;
-    case 0x08: display_dirty |= disp_mode != (v & 0xFF); disp_mode = v & 0xFF; break;
+    case 0x06: flip_valid = false; display_dirty |= (h_start | (h_end << 12)) != (int)(v & 0xFFFFFF); h_start = v & 0xFFF; h_end = (v >> 12) & 0xFFF; break;
+    case 0x07: flip_valid = false; display_dirty |= (v_start | (v_end << 10)) != (int)(v & 0xFFFFF); v_start = v & 0x3FF; v_end = (v >> 10) & 0x3FF; break;
+    case 0x08: flip_valid = false; display_dirty |= disp_mode != (v & 0xFF); disp_mode = v & 0xFF; break;
     case 0x09: allow_tex_disable = v & 1; break;
     case 0x10: {
         uint32_t r = 0;
@@ -1197,6 +1252,7 @@ int gpu_scale() { return 1 << sh; }
 
 void gpu_set_scale(int scale) {
     display_dirty = true;
+    flip_valid = false;
     int nsh = 0;
     while (nsh < 3 && (2 << nsh) <= scale) nsh++;
     gpu_sync();
