@@ -248,7 +248,7 @@ recompilation.
 | A2 | App paused on launch: phone locked with the screen off | 1 | Solved |
 | A3 | Accelerometer exposed as a joystick (tilt = D-pad presses) | 1 | Solved |
 | A4 | Misread a widescreen "slowdown" (compared race clocks at a fixed frame) | 1 | Solved (overclock) |
-| A5 | Android TV (Sony BRAVIA BF1): 32-bit only userland, ~3x too slow | 3 | In progress |
+| A5 | Android TV (Sony BRAVIA BF1): 32-bit only userland, ~3x too slow at first | 4 | In progress (2x: 44 → 21 ms/frame) |
 
 - **What had to change:**
   - `rt_setjmp/longjmp` for AArch64 (x19–x30, sp, d8–d15, fpcr);
@@ -298,6 +298,40 @@ recompilation.
   compiled-interpreter approach is the safe way to speed it up. One function per region took
   more than 10 minutes to compile; 512-instruction chunks with a small driver loop build in
   under 2 minutes.
+
+  **The compiled regions at first gained only ~10% on the TV.** Mirroring the interpreter
+  literally kept its per-instruction bookkeeping:
+  - a 64-bit cycle add (the fractional path, with the overclock on);
+  - a `c->pc` store;
+  - a 32-bit constant compare for the stop check.
+
+  On a 32-bit core that cost about as much as the decoding it replaced. Fixes that keep the
+  output exact:
+  - **Cycles:** count them in a local and add them to `c->cycles` only before something can
+    observe them (hardware accesses, event checks, calls, leaving the chunk). The same total
+    in one step gives the same result.
+  - **Stop check:** test it only when the stop address lies in the chunk.
+  - **`c->pc`:** set it only for control instructions; nothing but diagnostics reads it.
+  - **Registers:** keep the MIPS registers a chunk uses in locals, written back before calls,
+    events and longjmps. Otherwise `c->r` is reloaded after every store, since any store may
+    alias it.
+
+  The register caching first made the PC build take 29 minutes (31 registers written back at
+  every call site). Caching only the registers a chunk uses, writing back only those it
+  modifies, and 256-instruction chunks brought it to 11 minutes.
+
+  **Present only when the picture changed.** The GPU tracks writes overlapping the displayed
+  area, plus buffer flips and display setting changes. CTR draws races into the hidden buffer,
+  so half the refreshes skip the conversion and present (about 2 ms/frame on the TV).
+
+  **Where the TV stands (2x, fill, ms/frame):** 44 → 21. At the default 200% CPU, the
+  emulation thread is the whole limit (19 ms) and drawing is free; at 100% emulation is
+  16–18 ms but the 3 render threads then lag by 4–5 ms.
+  - **Lesson:** before planning a GPU renderer, check which thread is the bottleneck. Here it
+    would only help once emulation is near 15 ms.
+  - **Also:** a pc sampler (`--pc-sample`, with `--interp`) showed CTR spends ~45% of emulated
+    time in its frame-sync wait loop in widescreen with the overclock. That's cheap on the
+    host because it only polls RAM, so it isn't worth idle-loop skipping.
 - **Testing on the device:** `--keys` and other options go through the launch intent
   (`am start -e args '...'`). Quote the whole command for `adb shell`, or the device shell splits
   the value at the first space.
