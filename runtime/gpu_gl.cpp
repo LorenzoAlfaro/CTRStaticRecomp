@@ -57,14 +57,23 @@ static GLuint prog_draw = 0, prog_copy = 0, prog_present = 0;
 static struct { GLint size, vram, shift, pass, flip; } ud;
 static struct { GLint size, src, dst0, src0, div, mask, flip, src_h, src_flip; } uc;
 static struct { GLint vram, shift, origin, rgb24, flip, disp, cheap; } up;
-int g_gl_debug = 0;  // --gl-debug bits (experiments): 1 no mask pass, 2 cheap present, 4 draw nothing, 8 no dual-source blending
+int g_gl_debug = 0;  // --gl-debug bits (experiments): 1 no mask pass, 2 cheap present, 4 draw nothing,
+                     // 8 no dual-source blending, 16 no framebuffer fetch
 
 // ---- shaders ----------------------------------------------------------------------------------
 static const char* kHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
-// draw program with dual-source blending (GL_EXT_blend_func_extended), see flush()
+// Draw program variants, best first (see flush()): framebuffer fetch does all blending and the
+// mask check in the shader (mobile GPUs); dual-source blending folds the mask bit into the
+// colour pass; otherwise a colour pass plus a mask pass.
+static const char* kHeaderFetchExt =
+    "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define FETCH 1\n#define FETCH_EXT 1\n"
+    "precision highp float;\nprecision highp int;\n";
+static const char* kHeaderFetchArm =
+    "#version 300 es\n#extension GL_ARM_shader_framebuffer_fetch : require\n#define FETCH 1\n#define FETCH_ARM 1\n"
+    "precision highp float;\nprecision highp int;\n";
 static const char* kHeaderDual =
     "#version 300 es\n#extension GL_EXT_blend_func_extended : require\n#define DUAL 1\nprecision highp float;\nprecision highp int;\n";
-static bool g_dual = false;
+static bool g_dual = false, g_fetch = false;
 
 static const char* kDrawVS = R"(
 layout(location = 0) in vec2 a_pos;    // internal-resolution VRAM coordinates
@@ -92,7 +101,11 @@ uniform int u_flip;         // texture rows - 1 (VRAM row y is at texture row u_
 in vec3 v_col;
 in vec2 v_uv;
 flat in uvec2 v_mode;
-#ifdef DUAL
+#if defined(FETCH_EXT)
+layout(location = 0) inout vec4 o;  // framebuffer fetch: o holds the destination on entry
+#elif defined(FETCH_ARM)
+layout(location = 0) out vec4 o;
+#elif defined(DUAL)
 layout(location = 0, index = 0) out vec4 o;
 layout(location = 0, index = 1) out vec4 o1;  // background factor (dual-source blending)
 #else
@@ -108,9 +121,17 @@ void main() {
 #ifdef DUAL
     o1 = vec4(0.0);
 #endif
+#if defined(FETCH_EXT)
+    vec4 dst = o;
+#elif defined(FETCH_ARM)
+    vec4 dst = gl_LastFragColorARM;
+#endif
     uint m = v_mode.x;
     bool textured = (m & 1u) != 0u, raw = (m & 2u) != 0u, dith = (m & 4u) != 0u, semi = (m & 8u) != 0u;
     bool mask_set = (m & 16u) != 0u, rect = (m & 0x8000000u) != 0u;
+#ifdef FETCH
+    if ((m & 0x40000000u) != 0u && dst.a > 0.5) discard;  // mask check: keep masked pixels
+#endif
     ivec2 ip = ivec2(int(gl_FragCoord.x), u_flip - int(gl_FragCoord.y));  // internal VRAM pixel
     ivec2 np = ip >> u_shift;
     int dt = dither_tab[(np.y & 3) * 4 + (np.x & 3)];
@@ -153,6 +174,19 @@ void main() {
         if (dith) c = clamp(c + dt, 0, 255);
         rgb = c >> 3;
     }
+#ifdef FETCH
+    // all blending here, with the software renderer's integer arithmetic
+    if (semi_out) {
+        ivec3 b = ivec3(dst.rgb * 255.0 + 0.5) >> 3;
+        int mode = int((m >> 28) & 3u);
+        if (mode == 0) rgb = (b + rgb) >> 1;
+        else if (mode == 1) rgb = min(ivec3(31), b + rgb);
+        else if (mode == 2) rgb = max(ivec3(0), b - rgb);
+        else rgb = min(ivec3(31), b + (rgb >> 2));
+    }
+    o = vec4(vec3(rgb << 3) / 255.0, (mask || mask_set) ? 1.0 : 0.0);
+    return;
+#endif
     vec3 col = vec3(rgb << 3) / 255.0;
     if (u_pass == 3) {
         // single-pass blending (B_MAIN): result = src * k + dst * a
@@ -269,8 +303,8 @@ static GLuint compile(GLenum type, const char* src, const char* header = kHeader
     return s;
 }
 
-static GLuint link(const char* vs, const char* fs, bool dual = false) {
-    GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs, dual ? kHeaderDual : kHeader);
+static GLuint link(const char* vs, const char* fs, const char* fs_header = kHeader) {
+    GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs, fs_header);
     if (!v || !f) return 0;
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
@@ -468,6 +502,12 @@ static void flush() {
         // one ordered pass for opaque pixels and blend modes 0, 1, 3: the shader scales the
         // colour (x1/2, x1, x1/4) and outputs the background factor (1/2 or 1, 0 when opaque)
         // in alpha, result = src + dst * alpha; then the mask bits, in the same order
+        if (g_fetch) {
+            // framebuffer fetch: the shader reads the destination and blends itself
+            glDisable(GL_BLEND);
+            glDrawArrays(GL_TRIANGLES, 0, n);
+            break;
+        }
         glEnable(GL_BLEND);
         if (g_dual) {
             // the background factor comes from the second output, alpha is the mask bit
@@ -526,6 +566,7 @@ static uint32_t mode_bits(const DrawCtx& d, bool rect) {
     m |= (uint32_t)(d.clut_y & 511) << 18;
     if (rect) m |= 0x8000000u;
     m |= (uint32_t)(d.semi_mode & 3) << 28;
+    if (d.mask_check) m |= 0x40000000u;  // (honoured with framebuffer fetch)
     return m;
 }
 static uint32_t tw_bits(const DrawCtx& d) {
@@ -553,11 +594,11 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     if (x1 <= x0 || y1 <= y0) return;
     box = Rgn{std::max(box.x0, x0), std::max(box.y0, y0), std::min(box.x1, x1), std::min(box.y1, y1)};
     if (box.x1 <= box.x0 || box.y1 <= box.y0) return;
-    if (d.mask_check && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
+    if (d.mask_check && !g_fetch && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
     // a texture read of something drawn since the last refresh of the read copy
     for (int i = 0; i < nreads; i++)
         if (dirty_test(reads[i])) { sync_read(); break; }
-    BatchKind kind = !(d.semi && d.semi_mode == 2) ? B_MAIN : d.textured ? B_SEMI_TEX : B_SEMI;
+    BatchKind kind = g_fetch || !(d.semi && d.semi_mode == 2) ? B_MAIN : d.textured ? B_SEMI_TEX : B_SEMI;
     bool same_kind = batch_kind == kind && (kind == B_OPAQUE || kind == B_MAIN || batch_semi_mode == d.semi_mode);
     bool same_sc = sc_x0 == x0 << gsh && sc_y0 == y0 << gsh && sc_x1 == x1 << gsh && sc_y1 == y1 << gsh;
     bool same = same_kind && same_sc;
@@ -895,12 +936,18 @@ bool gl_thread_init() {
              strstr(ext, "framebuffer_fetch") != nullptr);
     }
     const char* ext = (const char*)glGetString(GL_EXTENSIONS);
-    if (ext && strstr(ext, "GL_EXT_blend_func_extended") && !(g_gl_debug & 8)) {
-        prog_draw = link(kDrawVS, kDrawFS, true);
+    if (ext && !(g_gl_debug & 16)) {
+        if (strstr(ext, "GL_EXT_shader_framebuffer_fetch")) prog_draw = link(kDrawVS, kDrawFS, kHeaderFetchExt);
+        if (!prog_draw && strstr(ext, "GL_ARM_shader_framebuffer_fetch")) prog_draw = link(kDrawVS, kDrawFS, kHeaderFetchArm);
+        g_fetch = prog_draw != 0;
+    }
+    if (!prog_draw && ext && strstr(ext, "GL_EXT_blend_func_extended") && !(g_gl_debug & 8)) {
+        prog_draw = link(kDrawVS, kDrawFS, kHeaderDual);
         g_dual = prog_draw != 0;
     }
     if (!prog_draw) prog_draw = link(kDrawVS, kDrawFS);
-    LOGI("GL: %s", g_dual ? "dual-source blending (one pass)" : "colour + mask passes");
+    LOGI("GL: %s", g_fetch ? "framebuffer fetch (blending in the shader)"
+                   : g_dual ? "dual-source blending (one pass)" : "colour + mask passes");
     prog_copy = link(kCopyVS, kCopyFS);
     prog_present = link(kPresentVS, kPresentFS);
     if (!prog_draw || !prog_copy || !prog_present) return false;
