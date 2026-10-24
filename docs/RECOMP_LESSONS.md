@@ -248,7 +248,7 @@ recompilation.
 | A2 | App paused on launch: phone locked with the screen off | 1 | Solved |
 | A3 | Accelerometer exposed as a joystick (tilt = D-pad presses) | 1 | Solved |
 | A4 | Misread a widescreen "slowdown" (compared race clocks at a fixed frame) | 1 | Solved (overclock) |
-| A5 | Android TV (Sony BRAVIA BF1): 32-bit only userland, ~3x too slow at first | 4 | In progress (2x: 44 → 21 ms/frame) |
+| A5 | Android TV (Sony BRAVIA BF1): 32-bit only userland, ~3x too slow at first | 4 | In progress (1x: ~17 ms/frame; GL renderer and faster regions not yet measured on the TV) |
 
 - **What had to change:**
   - `rt_setjmp/longjmp` for AArch64 (x19–x30, sp, d8–d15, fpcr);
@@ -324,7 +324,31 @@ recompilation.
   area, plus buffer flips and display setting changes. CTR draws races into the hidden buffer,
   so half the refreshes skip the conversion and present (about 2 ms/frame on the TV).
 
-  **Where the TV stands (2x, fill, ms/frame):** 44 → 21. At the default 200% CPU, the
+  **Labels only at entry points (2026-10-23): the biggest single win.** The regions still
+  labelled every instruction, made each a `switch` case and checked the stop address at each,
+  which keeps the compiler from optimizing across instructions. Labelling only addresses
+  execution can arrive at (constant branch/jump targets anywhere in the game, the address
+  after each delay slot, code/data words and `lui`+`addiu` constants pointing into a region)
+  and moving the stop check to chunk entry halved the PC's emulation time in races (2.1 → 1.0
+  ms/frame) and shrank the generated file from 10.9 to 6.0 MB. Anything else is declined and
+  run by the interpreter, so it stays exact; the reference run declined nothing.
+  - **Lesson:** a sampling profiler of the *host* instruction pointer, symbolized to the
+    generated C lines (`--host-sample`, `tools/host_profile.py`), found this in minutes. The
+    emulated-pc sampler can't see inside recompiled code.
+
+  **Audio thread (2026-10-23):** the SPU costs ~1 ms/frame on the TV. CTR never reads voice
+  state back, and its SPU IRQ only ever hits the capture buffer, whose position follows the
+  sample clock alone. So the CPU side keeps the register file, the clock, the capture position
+  and the IRQ, and the mixer runs behind on its own thread, applying each write at its sample
+  count. Bit-identical output (`--audio-dump`, `tools/verify.ps1`), ~0.9 ms/frame saved on the TV.
+
+  **OpenGL ES renderer (2026-10-23, `--renderer gl`):** VRAM as an RGBA8 texture with the 5-bit
+  channels in the top bits makes all four PS1 blend modes exact with fixed-function blending.
+  Store VRAM upside down so GL's top-left fill rule matches the PS1's. Not bit-identical (edges,
+  interpolation), but 0–2% of pixels differ at 4x; 3x faster than the software renderer at 4x
+  on the PC.
+
+  **Where the TV stood before these (2x, fill, ms/frame):** 44 → 21. At the default 200% CPU, the
   emulation thread is the whole limit (19 ms) and drawing is free; at 100% emulation is
   16–18 ms but the 3 render threads then lag by 4–5 ms.
   - **Lesson:** before planning a GPU renderer, check which thread is the bottleneck. Here it
