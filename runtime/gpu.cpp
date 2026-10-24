@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "gpu_jobs.h"
 #include "pgxp.h"
 #include "psx.h"
 
@@ -85,26 +86,6 @@ static inline void px_fill(int x, int y, uint16_t v) {
     }
 }
 
-constexpr int SUB = 8;  // sub-pixel bits of vertex positions (internal-resolution pixels)
-
-struct Vertex {
-    int32_t x, y;  // internal-resolution position, SUB fractional bits
-    int nx, ny;    // native integer position (for the GPU's size limits)
-    int r, g, b;
-    int u, v;
-};
-
-// Everything a primitive needs, captured when it is queued (workers render it later).
-struct DrawCtx {
-    bool textured, raw, semi, gouraud;
-    int semi_mode;
-    int tp_x, tp_y, tp_depth;  // texpage base (pixels) and depth 0=4bit 1=8bit 2=15bit
-    int clut_x, clut_y;
-    bool do_dither;
-    bool mask_set, mask_check;
-    uint8_t tw_mask_x, tw_mask_y, tw_off_x, tw_off_y;
-    int16_t da_x1, da_y1, da_x2, da_y2;
-};
 
 // Rows of the internal-resolution VRAM are split into bands of 8 lines, dealt round-robin
 // to the render workers; a worker only touches its own rows, so every pixel still sees
@@ -485,14 +466,6 @@ static void do_fill(int x, int y, int w, int h, uint16_t col, Band band) {
 // the emulated CPU keeps running. The queue is drained (gpu_sync) before anything reads
 // VRAM on the emulation thread, and before queuing a primitive whose texture/CLUT area may
 // have been written by primitives still in the queue (render-to-texture).
-enum JobKind : uint8_t { JOB_TRI, JOB_RECT, JOB_LINE, JOB_FILL, JOB_CONVERT, JOB_COPY };
-struct Job {
-    JobKind kind;
-    DrawCtx d;
-    Vertex v[3];  // triangle / line vertices; rect: v[0].nx/ny pos, v[1].nx/ny size, v[0].u/v
-    uint32_t* dst;  // JOB_CONVERT: ARGB output (v[0] = internal-res origin, v[1] = size)
-    int pitch;      // JOB_COPY: v[0] = src, v[1] = dst, v[2] = size (native, nx/ny)
-};
 
 static void do_copy(const Job& j, Band band) {
     int sx = j.v[0].nx, sy = j.v[0].ny, dx = j.v[1].nx, dy = j.v[1].ny, w = j.v[2].nx, h = j.v[2].ny;
@@ -556,7 +529,6 @@ static bool threaded = false;  // queue in use (worker threads available)
 // ending at line 215 does not overlap textures stored from line 216). A job is queued only if
 // it reads nothing pending to be written and writes nothing pending to be read; otherwise
 // the queue is drained first. Coordinates wrap around VRAM like the hardware does.
-struct Rgn { int x0, y0, x1, y1; };  // native, exclusive end
 struct TileMap {
     uint64_t bits[64];
     bool any;
@@ -594,20 +566,31 @@ static void run_job(const Job& j, Band band) {
     case JOB_FILL: do_fill(j.v[0].nx, j.v[0].ny, j.v[1].nx, j.v[1].ny, (uint16_t)j.v[0].r, band); break;
     case JOB_CONVERT: do_convert(j, band); break;
     case JOB_COPY: do_copy(j, band); break;
+    default: break;  // OpenGL renderer only
     }
 }
+
+static bool use_gl = false;           // OpenGL ES renderer: one worker, the GL thread
+static std::atomic<int> gl_ready{0};  // 1 initialized, -1 failed
 
 static void worker_main(int id) {
     WorkerState& me = workers[id];
     Band band{id, n_workers};
+    if (use_gl) {
+        bool ok = gl_thread_init();
+        gl_ready.store(ok ? 1 : -1);
+        if (!ok) return;
+    }
     for (;;) {
         uint64_t done = me.done.load(std::memory_order_relaxed);
         uint64_t head = q_head.load(std::memory_order_acquire);
         if (done < head) {
-            run_job(queue[done % kQueueSize], band);
+            if (use_gl) gl_run_job(queue[done % kQueueSize]);
+            else run_job(queue[done % kQueueSize], band);
             me.done.store(done + 1, std::memory_order_release);
             continue;
         }
+        if (use_gl) gl_idle();  // queue empty: let the GPU start on what is batched
         if (workers_quit.load()) return;
         // brief spin, then sleep until new work is published
         bool got = false;
@@ -704,9 +687,8 @@ static int job_writes(const Job& j, Rgn* out) {
     case JOB_COPY:
         out[0] = Rgn{j.v[1].nx, j.v[1].ny, j.v[1].nx + j.v[2].nx, j.v[1].ny + j.v[2].ny};
         return 1;
-    case JOB_CONVERT: return 0;
+    default: return 0;
     }
-    return 0;
 }
 
 // texture page and CLUT area a textured primitive reads
@@ -751,7 +733,7 @@ static void wake_workers();
 
 static void flip_convert() {
     flip_valid = false;
-    if (!threaded) return;
+    if (!threaded || use_gl) return;
     DisplayInfo d = gpu_display();
     if (d.rgb24 || !d.enabled) return;
     int b = flip_cur < 0 ? 0 : flip_cur ^ 1;
@@ -800,7 +782,7 @@ static void queue_job(const Job& j, const Rgn* reads = nullptr, int nreads = 0) 
         Rgn w[1];
         if (job_writes(j, w)) touch_display(w[0]);
     }
-    if (threaded) {
+    if (threaded && !use_gl) {  // the GL thread orders texture reads after writes itself
         Rgn w[1];
         int nw = job_writes(j, w);
         bool hz = false;
@@ -983,7 +965,7 @@ static void vram_copy() {
     Rgn dst{j.v[1].nx, j.v[1].ny, j.v[1].nx + j.v[2].nx, j.v[1].ny + j.v[2].ny};
     TileMap t{};
     t.mark(src);
-    if (t.test(dst)) {
+    if (t.test(dst) && !use_gl) {  // (the GL renderer copies from a snapshot of the source)
         // a copy between different but overlapping rows depends on row order: do it here
         gpu_sync();
         touch_display(dst);
@@ -998,10 +980,20 @@ static void start_workers() {
     // leave a core for the emulation thread (and one for the system on bigger CPUs)
     n_workers = (int)std::clamp<unsigned>(hc >= 6 ? hc - 2 : (hc > 1 ? hc - 1 : 1), 1, 12);
     if (const char* e = getenv("CTR_GPU_THREADS")) n_workers = std::clamp(atoi(e), 1, 32);
+    if (use_gl) n_workers = 1;
     workers = new WorkerState[n_workers];
     for (int i = 0; i < n_workers; i++) workers[i].th = std::thread(worker_main, i);
-    LOGI("GPU: %d render threads", n_workers);
+    if (use_gl) {
+        while (!gl_ready.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (gl_ready.load() < 0) fatal("the OpenGL ES renderer could not start (see ctr.log); try --renderer sw");
+        LOGI("GPU: OpenGL ES renderer");
+    } else {
+        LOGI("GPU: %d render threads", n_workers);
+    }
 }
+
+// OpenGL renderer: CPU uploads collected here and handed over when complete
+static std::vector<uint16_t>* gl_upload = nullptr;
 
 static int command_length(uint32_t w) {
     uint32_t op = w >> 24;
@@ -1033,12 +1025,17 @@ static void exec_command() {
     case 3: exec_rect(); return;
     case 4: vram_copy(); return;
     case 5: {
-        gpu_sync_why(2);  // uploads are written directly by the emulation thread
+        if (!use_gl) gpu_sync_why(2);  // uploads are written directly by the emulation thread
         upload.active = true;
         upload.x = cmd[1] & 0x3FF; upload.y = (cmd[1] >> 16) & 0x1FF;
         upload.w = ((cmd[2] & 0xFFFF) - 1) % 1024 + 1; upload.h = (((cmd[2] >> 16) & 0xFFFF) - 1) % 512 + 1;
         upload.cx = upload.cy = 0;
         touch_display(Rgn{upload.x, upload.y, upload.x + upload.w, upload.y + upload.h});
+        if (use_gl) {
+            delete gl_upload;
+            gl_upload = new std::vector<uint16_t>();
+            gl_upload->reserve((size_t)upload.w * upload.h);
+        }
         return;
     }
     case 6: {
@@ -1047,6 +1044,15 @@ static void exec_command() {
         download.x = cmd[1] & 0x3FF; download.y = (cmd[1] >> 16) & 0x1FF;
         download.w = ((cmd[2] & 0xFFFF) - 1) % 1024 + 1; download.h = (((cmd[2] >> 16) & 0xFFFF) - 1) % 512 + 1;
         download.cx = download.cy = 0;
+        if (use_gl) {
+            // VRAM lives on the graphics chip: read the area into the native mirror first
+            Job j{};
+            j.kind = JOB_READBACK;
+            j.v[0].nx = download.x; j.v[0].ny = download.y;
+            j.v[1].nx = download.w; j.v[1].ny = download.h;
+            submit(j);
+            gpu_sync();
+        }
         return;
     }
     default: break;
@@ -1074,6 +1080,27 @@ static void exec_command() {
 }
 
 static void upload_word(uint32_t w) {
+    if (use_gl) {
+        for (int k = 0; k < 2 && upload.active; k++) {
+            gl_upload->push_back((uint16_t)(k ? w >> 16 : w));
+            if (++upload.cx >= upload.w) {
+                upload.cx = 0;
+                if (++upload.cy >= upload.h) upload.active = false;
+            }
+        }
+        if (!upload.active) {
+            Job j{};
+            j.kind = JOB_UPLOAD;
+            j.d.mask_set = mask_set;
+            j.d.mask_check = mask_check;
+            j.v[0].nx = upload.x; j.v[0].ny = upload.y;
+            j.v[1].nx = upload.w; j.v[1].ny = upload.h;
+            j.data = gl_upload;  // the GL thread frees it
+            gl_upload = nullptr;
+            submit(j);
+        }
+        return;
+    }
     for (int k = 0; k < 2 && upload.active; k++) {
         uint16_t p = (uint16_t)(k ? w >> 16 : w);
         int x = upload.x + upload.cx, y = upload.y + upload.cy;
@@ -1248,16 +1275,26 @@ void gpu_convert_display(uint32_t* dst, int pitch_px, int x, int y, int w, int h
     gpu_sync();
 }
 uint16_t gpu_vram_native(int x, int y) { return px(x, y); }
-int gpu_scale() { return 1 << sh; }
+int gpu_scale() { return 1 << (use_gl ? g_gl_shift : sh); }
 
 void gpu_set_scale(int scale) {
     display_dirty = true;
     flip_valid = false;
     int nsh = 0;
     while (nsh < 3 && (2 << nsh) <= scale) nsh++;
+    if (use_gl) {
+        // the emulation side keeps native VRAM; the GL thread owns the scaled one
+        if (nsh == g_gl_shift) return;
+        g_gl_shift = nsh;
+        if (workers) {
+            Job j{};
+            j.kind = JOB_SCALE;
+            j.present.scale_shift = nsh;
+            submit(j);
+        }
+        return;
+    }
     gpu_sync();
-    threaded = std::thread::hardware_concurrency() >= 2;  // worker threads at every scale
-    if (threaded && !workers) start_workers();
     if (nsh == sh) return;
     // resample the current contents so a change while running keeps the picture
     std::vector<uint16_t> old;
@@ -1278,9 +1315,34 @@ void gpu_set_scale(int scale) {
 void gpu_set_dither(bool on) { dither_mode = on ? 1 : 0; }
 bool gpu_dither() { return dither_mode != 0; }
 
+void gpu_use_gl() {
+    if (use_gl || workers) return;
+    use_gl = true;
+    g_gl_shift = sh;
+    sh = 0;
+    VW = 1024;
+    VH = 512;
+    vram.assign((size_t)VW * VH, 0);
+    g_gl_mirror = vram.data();
+}
+bool gpu_gl() { return use_gl; }
+
+// OpenGL renderer: show the display area (and copy it for a screenshot: waits)
+void gpu_gl_present(const PresentInfo& p) {
+    Job j{};
+    j.kind = JOB_PRESENT;
+    j.present = p;
+    j.present.disp = gpu_display();
+    submit(j);
+    if (p.shot) gpu_sync();
+}
+
 void gpu_init() {
     gpu_sync();
     std::fill(vram.begin(), vram.end(), 0);
+    // render threads at every scale when the CPU has a core to spare (the GL renderer always)
+    threaded = use_gl || std::thread::hardware_concurrency() >= 2;
+    if (threaded && !workers) start_workers();
     gpu_write_gp1(0);
 }
 

@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu_jobs.h"
 #include "pgxp.h"
 #include "psx.h"
 
@@ -23,8 +24,21 @@ bool g_quit = false;
 std::string g_data_dir = ".";
 void bios_flush_cards();
 
+extern SDL_Window* g_gl_window;
+extern SDL_GLContext g_gl_context;
+
 static SDL_Window* window = nullptr;
 static SDL_Renderer* renderer = nullptr;
+static bool gl_on = false;    // OpenGL ES renderer (--renderer gl)
+static bool want_gl = false;
+static int win_display = -1;  // monitor for the window
+
+// drawable size of the window
+static void output_size(int& w, int& h) {
+    w = h = 0;
+    if (gl_on) SDL_GL_GetDrawableSize(window, &w, &h);
+    else if (renderer) SDL_GetRendererOutputSize(renderer, &w, &h);
+}
 static SDL_Texture* texture = nullptr;
 static int tex_w = 0, tex_h = 0;
 static SDL_AudioDeviceID audio_dev = 0;
@@ -139,9 +153,9 @@ static void apply_aspect() {
     double a = 4.0 / 3.0;
     if (aspect_mode == ASPECT_16_9) a = 16.0 / 9.0;
     if (aspect_mode == ASPECT_FILL && fill_override > 0) a = fill_override;
-    else if (aspect_mode == ASPECT_FILL && renderer) {
+    else if (aspect_mode == ASPECT_FILL && (renderer || gl_on)) {
         int ww = 0, wh = 0;
-        SDL_GetRendererOutputSize(renderer, &ww, &wh);
+        output_size(ww, wh);
         if (ww > 0 && wh > 0) a = (double)ww / wh;
     }
     if (a != aspect()) set_aspect(a);
@@ -162,6 +176,7 @@ static void load_settings() {
         if (sscanf(line, "scale=%d", &v) == 1) gpu_set_scale(v);
         if (sscanf(line, "pgxp=%d", &v) == 1) g_pgxp = v != 0;
         if (sscanf(line, "dither=%d", &v) == 1) gpu_set_dither(v != 0);
+        if (sscanf(line, "renderer=%d", &v) == 1) want_gl = v == 1;
     }
     fclose(f);
 }
@@ -174,6 +189,7 @@ static void save_settings() {
     fprintf(f, "scale=%d\n", gpu_scale());
     fprintf(f, "pgxp=%d\n", g_pgxp ? 1 : 0);
     fprintf(f, "dither=%d\n", gpu_dither() ? 1 : 0);
+    fprintf(f, "renderer=%d\n", gl_on ? 1 : 0);
     fclose(f);
 }
 
@@ -393,7 +409,7 @@ void frontend_vblank() {
     double t0 = now_seconds();
     display_size(frame_w, frame_h);
     bool new_texture = false;
-    if (!texture || frame_w > tex_w || frame_h > tex_h) {
+    if (!gl_on && (!texture || frame_w > tex_w || frame_h > tex_h)) {
         if (texture) SDL_DestroyTexture(texture);
         tex_w = std::max(frame_w, 1024);
         tex_h = std::max(frame_h, 512);
@@ -401,7 +417,7 @@ void frontend_vblank() {
         new_texture = true;
     }
     int ww, wh;
-    SDL_GetRendererOutputSize(renderer, &ww, &wh);
+    output_size(ww, wh);
     // CTR's projection assumes its 216 lines fill a 4:3 screen; widescreen renders a wider
     // field of view into the same buffer, shown stretched to the target aspect
     apply_aspect();  // follows window size changes in fill mode (takes effect next frame)
@@ -414,7 +430,26 @@ void frontend_vblank() {
     bool redraw = gpu_take_display_dirty() || new_texture || shot_now || ww != last_ww || wh != last_wh ||
                   frame_w != last_fw || frame_h != last_fh || a != last_a;
     double t1 = t0, t2 = t0;
-    if (redraw) {
+    if (redraw && gl_on) {
+        // the GL thread draws the display area to the window (and copies it for screenshots)
+        last_ww = ww; last_wh = wh; last_fw = frame_w; last_fh = frame_h; last_a = a;
+        g_presents++;
+        int dw = ww, dh = (int)(ww / a + 0.5);
+        if (dh > wh) { dh = wh; dw = (int)(wh * a + 0.5); }
+        PresentInfo p{};
+        p.win_w = ww; p.win_h = wh;
+        p.dst_x = (ww - dw) / 2; p.dst_y = (wh - dh) / 2; p.dst_w = dw; p.dst_h = dh;
+        p.swap = true;
+        if (shot_now) {
+            if (frame.size() < (size_t)frame_w * frame_h) frame.resize((size_t)frame_w * frame_h);
+            p.shot = frame.data();
+            p.shot_w = frame_w;
+            p.shot_h = frame_h;
+        }
+        t1 = now_seconds();
+        gpu_gl_present(p);
+        t2 = t1;
+    } else if (redraw) {
         last_ww = ww; last_wh = wh; last_fw = frame_w; last_fh = frame_h; last_a = a;
         g_presents++;
         SDL_Rect src = {0, 0, frame_w, frame_h};
@@ -512,10 +547,10 @@ void frontend_vblank() {
     static uint64_t fps_n = 0;
     if (fps_t == 0) fps_t = t;
     if (t - fps_t >= 1.0) {
-        char title[128];
-        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps - %s (%.2f:1) - %dx%s - CPU %d%%",
+        char title[160];
+        snprintf(title, sizeof title, "Crash Team Racing (static recomp) - %.1f fps - %s (%.2f:1) - %dx%s - CPU %d%% - %s",
                  (frame_counter - fps_n) / (t - fps_t), aspect_names[aspect_mode], aspect(), gpu_scale(),
-                 g_pgxp ? " PGXP" : "", overclock());
+                 g_pgxp ? " PGXP" : "", overclock(), gl_on ? "GPU renderer" : "software renderer");
         SDL_SetWindowTitle(window, title);
 #ifdef __ANDROID__
         // no window title on a phone: log it now and then
@@ -626,6 +661,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-pgxp")) g_pgxp = false;
         else if (!strcmp(argv[i], "--dither")) gpu_set_dither(true);
         else if (!strcmp(argv[i], "--no-dither")) gpu_set_dither(false);
+        else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) want_gl = !strcmp(argv[++i], "gl");
+        else if (!strcmp(argv[i], "--display") && i + 1 < argc) win_display = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
             shot_frame = strtoull(argv[++i], nullptr, 10);
@@ -666,17 +703,42 @@ int main(int argc, char** argv) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
+    // --display N / CTR_DISPLAY=N: open the window on monitor N (0 = primary)
+    if (win_display < 0) win_display = getenv("CTR_DISPLAY") ? atoi(getenv("CTR_DISPLAY")) : 0;
+    if (win_display >= SDL_GetNumVideoDisplays()) win_display = 0;
+    uint32_t gl_flag = 0;
+    if (want_gl) {
+        // OpenGL ES 3.0 everywhere (desktop drivers provide ES contexts too)
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+        gl_flag = SDL_WINDOW_OPENGL;
+    }
 #ifdef __ANDROID__
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     window = SDL_CreateWindow("Crash Team Racing (static recomp)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                              1280, 960, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI);
+                              1280, 960, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI | gl_flag);
 #else
-    window = SDL_CreateWindow("Crash Team Racing (static recomp)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                              1280, 960, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    window = SDL_CreateWindow("Crash Team Racing (static recomp)", SDL_WINDOWPOS_CENTERED_DISPLAY(win_display), SDL_WINDOWPOS_CENTERED_DISPLAY(win_display),
+                              1280, 960, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | gl_flag);
 #endif
     SDL_RaiseWindow(window);
     SDL_SetWindowInputFocus(window);
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (want_gl) {
+        g_gl_context = SDL_GL_CreateContext(window);
+        if (g_gl_context) {
+            SDL_GL_MakeCurrent(window, nullptr);  // the GL render thread takes it
+            g_gl_window = window;
+            gl_on = true;
+            gpu_use_gl();
+        } else {
+            LOGW("OpenGL ES 3.0 context: %s; using the software renderer", SDL_GetError());
+        }
+    }
+    if (!gl_on) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
     SDL_AudioSpec want{}, have{};
     want.freq = 44100;
