@@ -20,6 +20,8 @@
 #include <SDL.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -79,7 +81,8 @@ void main() {
 static const char* kDrawFS = R"(
 uniform sampler2D u_vram;   // read copy of VRAM
 uniform int u_shift;        // log2(scale)
-uniform int u_pass;         // 0 all texels, 1 opaque texels only, 2 semi-transparent texels only
+uniform int u_pass;         // 0 all texels, 1 opaque texels only, 2 semi-transparent texels only,
+                            // 3 single-pass blending (colour), 4 mask bits (alpha)
 uniform int u_flip;         // texture rows - 1 (VRAM row y is at texture row u_flip - y)
 in vec3 v_col;
 in vec2 v_uv;
@@ -100,7 +103,7 @@ void main() {
     int dt = dither_tab[(np.y & 3) * 4 + (np.x & 3)];
     ivec3 c = clamp(ivec3(floor(v_col + 0.5)), 0, 255);
     ivec3 rgb;
-    bool mask = false;
+    bool mask = false, semi_out = semi;  // semi_out: this pixel is blended
     if (textured) {
         vec2 uvf = rect ? floor(v_uv) : floor(v_uv + 0.5);
         int u = clamp(int(uvf.x), rect ? -100000 : 0, rect ? 100000 : 255) & 255;
@@ -125,6 +128,7 @@ void main() {
         if (t == 0u) discard;
         bool semi_px = semi && (t & 0x8000u) != 0u;
         if ((u_pass == 1 && semi_px) || (u_pass == 2 && !semi_px)) discard;
+        semi_out = semi_px;
         ivec3 tc = ivec3(int(t & 31u), int((t >> 5) & 31u), int((t >> 10) & 31u));
         if (!raw) {
             if (dith) tc = clamp((((tc << 3) * c) >> 7) + dt, 0, 255) >> 3;
@@ -136,7 +140,20 @@ void main() {
         if (dith) c = clamp(c + dt, 0, 255);
         rgb = c >> 3;
     }
-    o = vec4(vec3(rgb << 3) / 255.0, (mask || mask_set) ? 1.0 : 0.0);
+    vec3 col = vec3(rgb << 3) / 255.0;
+    if (u_pass == 3) {
+        // single-pass blending (B_MAIN): result = src * k + dst * a
+        int mode = int((m >> 28) & 3u);
+        float k = 1.0, a = 0.0;
+        if (semi_out) {
+            if (mode == 0) { k = 0.5; a = 0.5; }       // (b + f) / 2
+            else if (mode == 1) { a = 1.0; }          // b + f
+            else { k = 0.25; a = 1.0; }               // b + f / 4 (mode 2 never comes here)
+        }
+        o = vec4(col * k, a);
+        return;
+    }
+    o = vec4(col, (mask || mask_set) ? 1.0 : 0.0);  // pass 4 writes only this alpha (the mask bit)
 }
 )";
 
@@ -364,13 +381,15 @@ struct GV {
     float u, v;
     uint32_t mode, tw;
 };
-enum BatchKind { B_NONE, B_OPAQUE, B_SEMI, B_SEMI_TEX };
+enum BatchKind { B_NONE, B_OPAQUE, B_SEMI, B_SEMI_TEX, B_MAIN };  // B_SEMI*: blend mode 2 (b - f) only
 static std::vector<GV> batch;
 static BatchKind batch_kind = B_NONE;
 static int batch_semi_mode = 0;
 static int sc_x0 = 0, sc_y0 = 0, sc_x1 = 0, sc_y1 = 0;  // batch scissor, internal VRAM pixels
 static std::vector<Rgn> batch_boxes;                   // B_SEMI_TEX: areas of the batch's primitives
 static uint64_t g_batches = 0, g_prims = 0, g_mask_check = 0;
+static uint64_t g_break_why[3];  // new batch because of: kind / blend mode, drawing area, overlap (semi tex)
+static uint64_t g_busy_ns = 0;   // time spent on jobs (profiling)
 
 static void set_blend(int mode) {
     glEnable(GL_BLEND);
@@ -424,6 +443,22 @@ static void flush() {
         glUniform1i(ud.pass, 0);
         glDrawArrays(GL_TRIANGLES, 0, n);
         break;
+    case B_MAIN:
+        // one ordered pass for opaque pixels and blend modes 0, 1, 3: the shader scales the
+        // colour (x1/2, x1, x1/4) and outputs the background factor (1/2 or 1, 0 when opaque)
+        // in alpha, result = src + dst * alpha; then the mask bits, in the same order
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(GL_ONE, GL_SRC_ALPHA, GL_ZERO, GL_ONE);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glColorMask(1, 1, 1, 0);
+        glUniform1i(ud.pass, 3);
+        glDrawArrays(GL_TRIANGLES, 0, n);
+        glDisable(GL_BLEND);
+        glColorMask(0, 0, 0, 1);
+        glUniform1i(ud.pass, 4);
+        glDrawArrays(GL_TRIANGLES, 0, n);
+        glColorMask(1, 1, 1, 1);
+        break;
     case B_SEMI:
         set_blend(batch_semi_mode);
         glUniform1i(ud.pass, 0);
@@ -459,6 +494,7 @@ static uint32_t mode_bits(const DrawCtx& d, bool rect) {
     m |= (uint32_t)((d.clut_x / 16) & 63) << 12;
     m |= (uint32_t)(d.clut_y & 511) << 18;
     if (rect) m |= 0x8000000u;
+    m |= (uint32_t)(d.semi_mode & 3) << 28;
     return m;
 }
 static uint32_t tw_bits(const DrawCtx& d) {
@@ -490,14 +526,16 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     // a texture read of something drawn since the last refresh of the read copy
     for (int i = 0; i < nreads; i++)
         if (dirty_test(reads[i])) { sync_read(); break; }
-    BatchKind kind = !d.semi ? B_OPAQUE : d.textured ? B_SEMI_TEX : B_SEMI;
-    bool same = batch_kind == kind && (kind == B_OPAQUE || batch_semi_mode == d.semi_mode) && sc_x0 == x0 << gsh &&
-                sc_y0 == y0 << gsh && sc_x1 == x1 << gsh && sc_y1 == y1 << gsh;
+    BatchKind kind = !(d.semi && d.semi_mode == 2) ? B_MAIN : d.textured ? B_SEMI_TEX : B_SEMI;
+    bool same_kind = batch_kind == kind && (kind == B_OPAQUE || kind == B_MAIN || batch_semi_mode == d.semi_mode);
+    bool same_sc = sc_x0 == x0 << gsh && sc_y0 == y0 << gsh && sc_x1 == x1 << gsh && sc_y1 == y1 << gsh;
+    bool same = same_kind && same_sc;
     if (same && kind == B_SEMI_TEX) {
         // the two passes reorder overlapping primitives: keep those in separate batches
         for (const Rgn& b : batch_boxes)
             if (b.x0 < box.x1 && box.x0 < b.x1 && b.y0 < box.y1 && box.y0 < b.y1) { same = false; break; }
     }
+    if (!same && batch_kind != B_NONE) g_break_why[!same_kind ? 0 : !same_sc ? 1 : 2]++;
     if (!same) {
         flush();
         batch_kind = kind;
@@ -861,7 +899,24 @@ bool gl_thread_init() {
     return true;
 }
 
+static void gl_run_job_inner(const Job& j);
+static uint64_t g_present_ns = 0, g_jobs = 0;
+static inline uint64_t now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void gl_run_job(const Job& j) {
+    uint64_t t0 = g_spu_profile ? now_ns() : 0;
+    gl_run_job_inner(j);
+    if (g_spu_profile) {
+        uint64_t dt = now_ns() - t0;
+        g_busy_ns += dt;
+        if (j.kind == JOB_PRESENT) g_present_ns += dt;
+        g_jobs++;
+    }
+}
+
+static void gl_run_job_inner(const Job& j) {
     switch (j.kind) {
     case JOB_TRI: draw_tri(j); break;
     case JOB_RECT: draw_rect(j); break;
@@ -886,9 +941,16 @@ void gl_idle() {
     glFlush();
 }
 
-void gl_stats(uint64_t* batches, uint64_t* prims, uint64_t* syncs) {
-    *batches = g_batches; *prims = g_prims; *syncs = g_read_syncs;
-    g_batches = g_prims = g_read_syncs = 0;
+// one profile line (per-frame averages over `frames`), counters reset; racy, statistics only
+void gl_stats_line(char* out, size_t size, int frames) {
+    double f = frames;
+    snprintf(out, size,
+             "GL thread busy %.2f ms/frame (present %.2f), %.0f jobs, %.0f prims, %.0f batches (new: kind %.0f, area %.0f, "
+             "overlap %.0f), %.1f read copies",
+             g_busy_ns / 1e6 / f, g_present_ns / 1e6 / f, g_jobs / f, g_prims / f, g_batches / f, g_break_why[0] / f,
+             g_break_why[1] / f, g_break_why[2] / f, g_read_syncs / f);
+    g_busy_ns = g_present_ns = g_jobs = g_prims = g_batches = g_read_syncs = 0;
+    memset(g_break_why, 0, sizeof g_break_why);
 }
 
 }  // namespace psx

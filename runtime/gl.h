@@ -65,6 +65,7 @@ namespace psx {
     X(void, glBlendFuncSeparate, (GLenum sc, GLenum dc, GLenum sa, GLenum da))                           \
     X(void, glBlendEquationSeparate, (GLenum c, GLenum a))                                               \
     X(void, glBlendColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a))                                  \
+    X(void, glColorMask, (GLboolean r, GLboolean g, GLboolean b, GLboolean a))                           \
     X(void, glGenTextures, (GLsizei n, GLuint* t))                                                       \
     X(void, glDeleteTextures, (GLsizei n, const GLuint* t))                                              \
     X(void, glBindTexture, (GLenum target, GLuint t))                                                    \

@@ -65,7 +65,7 @@ struct Rgn { int x0, y0, x1, y1; };  // native, exclusive end
 bool gl_thread_init();            // make the context current, create resources; false on failure
 void gl_run_job(const Job& j);
 void gl_idle();                   // queue empty: send pending drawing to the GPU
-void gl_stats(uint64_t* batches, uint64_t* prims, uint64_t* read_syncs);  // since the last call
+void gl_stats_line(char* out, size_t size, int frames);  // profile line, resets the counters
 extern uint16_t* g_gl_mirror;     // JOB_READBACK target (native 1024x512)
 extern int g_gl_shift;            // log2 of the GL renderer's internal resolution
 
