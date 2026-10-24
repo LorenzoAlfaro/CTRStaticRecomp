@@ -27,6 +27,7 @@ void bios_flush_cards();
 
 extern SDL_Window* g_gl_window;
 extern SDL_GLContext g_gl_context;
+extern int g_gl_debug;
 
 static SDL_Window* window = nullptr;
 static SDL_Renderer* renderer = nullptr;
@@ -675,6 +676,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-dither")) gpu_set_dither(false);
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) want_gl = !strcmp(argv[++i], "gl");
         else if (!strcmp(argv[i], "--display") && i + 1 < argc) win_display = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gl-debug") && i + 1 < argc) g_gl_debug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
             shot_frame = strtoull(argv[++i], nullptr, 10);

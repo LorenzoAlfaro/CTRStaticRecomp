@@ -56,10 +56,15 @@ static GLuint vao = 0, vbo = 0;
 static GLuint prog_draw = 0, prog_copy = 0, prog_present = 0;
 static struct { GLint size, vram, shift, pass, flip; } ud;
 static struct { GLint size, src, dst0, src0, div, mask, flip, src_h, src_flip; } uc;
-static struct { GLint vram, shift, origin, rgb24, flip, disp; } up;
+static struct { GLint vram, shift, origin, rgb24, flip, disp, cheap; } up;
+int g_gl_debug = 0;  // --gl-debug bits (experiments): 1 no mask pass, 2 cheap present, 4 draw nothing, 8 no dual-source blending
 
 // ---- shaders ----------------------------------------------------------------------------------
 static const char* kHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+// draw program with dual-source blending (GL_EXT_blend_func_extended), see flush()
+static const char* kHeaderDual =
+    "#version 300 es\n#extension GL_EXT_blend_func_extended : require\n#define DUAL 1\nprecision highp float;\nprecision highp int;\n";
+static bool g_dual = false;
 
 static const char* kDrawVS = R"(
 layout(location = 0) in vec2 a_pos;    // internal-resolution VRAM coordinates
@@ -87,7 +92,12 @@ uniform int u_flip;         // texture rows - 1 (VRAM row y is at texture row u_
 in vec3 v_col;
 in vec2 v_uv;
 flat in uvec2 v_mode;
+#ifdef DUAL
+layout(location = 0, index = 0) out vec4 o;
+layout(location = 0, index = 1) out vec4 o1;  // background factor (dual-source blending)
+#else
 layout(location = 0) out vec4 o;
+#endif
 const int dither_tab[16] = int[16](-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2);
 uint fetch(int x, int y) {
     vec4 c = texelFetch(u_vram, ivec2((x & 1023) << u_shift, u_flip - ((y & 511) << u_shift)), 0);
@@ -95,6 +105,9 @@ uint fetch(int x, int y) {
     return (k.r >> 3) | ((k.g >> 3) << 5) | ((k.b >> 3) << 10) | (k.a > 127u ? 0x8000u : 0u);
 }
 void main() {
+#ifdef DUAL
+    o1 = vec4(0.0);
+#endif
     uint m = v_mode.x;
     bool textured = (m & 1u) != 0u, raw = (m & 2u) != 0u, dith = (m & 4u) != 0u, semi = (m & 8u) != 0u;
     bool mask_set = (m & 16u) != 0u, rect = (m & 0x8000000u) != 0u;
@@ -150,7 +163,12 @@ void main() {
             else if (mode == 1) { a = 1.0; }          // b + f
             else { k = 0.25; a = 1.0; }               // b + f / 4 (mode 2 never comes here)
         }
+#ifdef DUAL
+        o = vec4(col * k, (mask || mask_set) ? 1.0 : 0.0);  // the mask bit in the same pass
+        o1 = vec4(a);
+#else
         o = vec4(col * k, a);
+#endif
         return;
     }
     o = vec4(col, (mask || mask_set) ? 1.0 : 0.0);  // pass 4 writes only this alpha (the mask bit)
@@ -195,6 +213,7 @@ uniform int u_shift;
 uniform ivec2 u_origin;  // display origin (native)
 uniform ivec2 u_disp;    // display size (native)
 uniform int u_rgb24;
+uniform int u_cheap;  // experiment: nearest sampling, one fetch
 uniform int u_flip;
 in vec2 v_uv;
 layout(location = 0) out vec4 o;
@@ -223,6 +242,7 @@ void main() {
         o = vec4(vec3(r, g, b) / 255.0, 1.0);
         return;
     }
+    if (u_cheap != 0) { o = vec4(px15(ivec2(v_uv * float(1 << u_shift))), 1.0); return; }
     vec2 f = v_uv * float(1 << u_shift) - 0.5;
     ivec2 i0 = ivec2(floor(f));
     vec2 t = f - floor(f);
@@ -232,9 +252,9 @@ void main() {
 }
 )";
 
-static GLuint compile(GLenum type, const char* src) {
+static GLuint compile(GLenum type, const char* src, const char* header = kHeader) {
     GLuint s = glCreateShader(type);
-    const char* parts[2] = {kHeader, src};
+    const char* parts[2] = {header, src};
     glShaderSource(s, 2, parts, nullptr);
     glCompileShader(s);
     GLint ok = 0;
@@ -249,8 +269,8 @@ static GLuint compile(GLenum type, const char* src) {
     return s;
 }
 
-static GLuint link(const char* vs, const char* fs) {
-    GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+static GLuint link(const char* vs, const char* fs, bool dual = false) {
+    GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs, dual ? kHeaderDual : kHeader);
     if (!v || !f) return 0;
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
@@ -437,6 +457,7 @@ static void flush() {
     glUniform1i(ud.vram, 0);
     bind_vertices(batch.data(), batch.size() * sizeof(GV));
     GLsizei n = (GLsizei)batch.size();
+    if (g_gl_debug & 4) n = 0;  // experiment: draw nothing
     switch (batch_kind) {
     case B_OPAQUE:
         glDisable(GL_BLEND);
@@ -448,12 +469,22 @@ static void flush() {
         // colour (x1/2, x1, x1/4) and outputs the background factor (1/2 or 1, 0 when opaque)
         // in alpha, result = src + dst * alpha; then the mask bits, in the same order
         glEnable(GL_BLEND);
+        if (g_dual) {
+            // the background factor comes from the second output, alpha is the mask bit
+            glBlendFuncSeparate(GL_ONE, GL_SRC1_COLOR, GL_ONE, GL_ZERO);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glUniform1i(ud.pass, 3);
+            glDrawArrays(GL_TRIANGLES, 0, n);
+            glDisable(GL_BLEND);
+            break;
+        }
         glBlendFuncSeparate(GL_ONE, GL_SRC_ALPHA, GL_ZERO, GL_ONE);
         glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
         glColorMask(1, 1, 1, 0);
         glUniform1i(ud.pass, 3);
         glDrawArrays(GL_TRIANGLES, 0, n);
         glDisable(GL_BLEND);
+        if (g_gl_debug & 1) { glColorMask(1, 1, 1, 1); break; }  // experiment: no mask pass
         glColorMask(0, 0, 0, 1);
         glUniform1i(ud.pass, 4);
         glDrawArrays(GL_TRIANGLES, 0, n);
@@ -819,6 +850,11 @@ static void present(const PresentInfo& p) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
+    static int logged_w = 0, logged_h = 0;
+    if (p.win_w != logged_w || p.win_h != logged_h) {
+        logged_w = p.win_w; logged_h = p.win_h;
+        LOGI("GL: output %dx%d, picture %dx%d", p.win_w, p.win_h, p.dst_w, p.dst_h);
+    }
     glViewport(0, 0, p.win_w, p.win_h);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -833,6 +869,7 @@ static void present(const PresentInfo& p) {
         glUniform2i(up.disp, p.disp.w, p.disp.h);
         glUniform1i(up.rgb24, p.disp.rgb24 ? 1 : 0);
         glUniform1i(up.flip, VH - 1);
+        glUniform1i(up.cheap, (g_gl_debug & 2) ? 1 : 0);
         float w = (float)p.disp.w, h = (float)p.disp.h;
         GV v[6] = {gv(-1, 1, 0, 0, 0, 0, 0, 0, 0), gv(1, 1, 0, 0, 0, w, 0, 0, 0), gv(-1, -1, 0, 0, 0, 0, h, 0, 0),
                    gv(1, 1, 0, 0, 0, w, 0, 0, 0), gv(1, -1, 0, 0, 0, w, h, 0, 0), gv(-1, -1, 0, 0, 0, 0, h, 0, 0)};
@@ -853,7 +890,17 @@ bool gl_thread_init() {
     if (!gl_load_functions()) return false;
     LOGI("GL: %s / %s / %s", (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER),
          (const char*)glGetString(GL_VERSION));
-    prog_draw = link(kDrawVS, kDrawFS);
+    if (const char* ext = (const char*)glGetString(GL_EXTENSIONS)) {
+        LOGI("GL: blend_func_extended %d, framebuffer_fetch %d", strstr(ext, "blend_func_extended") != nullptr,
+             strstr(ext, "framebuffer_fetch") != nullptr);
+    }
+    const char* ext = (const char*)glGetString(GL_EXTENSIONS);
+    if (ext && strstr(ext, "GL_EXT_blend_func_extended") && !(g_gl_debug & 8)) {
+        prog_draw = link(kDrawVS, kDrawFS, true);
+        g_dual = prog_draw != 0;
+    }
+    if (!prog_draw) prog_draw = link(kDrawVS, kDrawFS);
+    LOGI("GL: %s", g_dual ? "dual-source blending (one pass)" : "colour + mask passes");
     prog_copy = link(kCopyVS, kCopyFS);
     prog_present = link(kPresentVS, kPresentFS);
     if (!prog_draw || !prog_copy || !prog_present) return false;
@@ -877,6 +924,7 @@ bool gl_thread_init() {
     up.disp = glGetUniformLocation(prog_present, "u_disp");
     up.rgb24 = glGetUniformLocation(prog_present, "u_rgb24");
     up.flip = glGetUniformLocation(prog_present, "u_flip");
+    up.cheap = glGetUniformLocation(prog_present, "u_cheap");
 
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
