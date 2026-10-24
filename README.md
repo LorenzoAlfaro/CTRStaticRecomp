@@ -51,8 +51,10 @@ for anyone writing a recompiler.
 * **Overlays.** Overlays share load addresses (three regions). Calls into an overlay region
   check which overlay is actually resident (by comparing the function's code bytes with RAM).
 * **Interpreter.** CTR's hand-written render assembly (register continuations, loops that
-  return several levels at once, `ra`/`sp` used as data) and anything not recompiled runs on a
-  MIPS interpreter that follows exact MIPS control flow. It is fast enough for full speed.
+  return several levels at once, `ra`/`sp` used as data) and anything not recompiled follows
+  exact MIPS control flow. The render asm is compiled at build time into C that does exactly
+  what the interpreter does (`gen/flat.py`), with labels only at addresses execution can arrive
+  at; any other arrival falls back to the interpreter for that instruction.
 * **CTR's thread system.** `ThTick_SetAndExec` / `ThTick_FastRET` abandon the current tick and
   resume `ThTick_RunBucket`; the runtime models this with an unwind point at that call site.
   Non-local jumps use `rt_setjmp`/`rt_longjmp` (`runtime/jmp.c`), which preserve all Win64
@@ -60,8 +62,9 @@ for anyone writing a recompiler.
 * **HLE BIOS.** The ~50 BIOS functions CTR uses are implemented natively, including the
   interrupt chain (run on a kernel stack) and PsyQ's `HookEntryInt` exit, events, and memory
   cards (`memcard1.mcd`, standard 128 KiB format).
-* **Hardware.** Software GPU rasterizer, GTE, SPU (ADPCM voices, ADSR, reverb, XA input,
-  capture buffers/IRQ), CD-ROM controller with XA-ADPCM, timers, DMA, controller port.
+* **Hardware.** GPU (software rasterizer, or OpenGL ES 3), GTE, SPU (ADPCM voices, ADSR,
+  reverb, XA input, capture buffers/IRQ; mixed on its own thread), CD-ROM controller with
+  XA-ADPCM, timers, DMA, controller port.
 
 ## Building
 
@@ -122,6 +125,25 @@ Performance on a Ryzen 5 3600 during a race: about 8 ms per frame at 4x (well wi
 16.7 ms of a 60 Hz frame). `CTR_PROFILE=1` logs a per-frame breakdown every 300 frames,
 `CTR_GPU_THREADS=N` sets the number of render threads.
 
+### GPU renderer
+
+`--renderer gl` (or `renderer=1` in `ctr.cfg`) draws with OpenGL ES 3 on the graphics chip
+instead (`runtime/gpu_gl.cpp`); the software renderer stays the default on Windows and is the
+reference for testing.
+
+* VRAM is a texture at the internal resolution. Each PS1 pixel is stored with its 5-bit
+  channels in the top bits and the mask bit in alpha, which makes the PS1 blend modes exact.
+* Shaders decode texture pages, CLUTs and texture windows and do colour modulation and dithering
+  with the software renderer's integer arithmetic. The texture is stored upside down so GL's
+  top-left fill rule matches the PS1's.
+* Blending, best method first: framebuffer fetch (mobile GPUs; blending and the mask check in
+  the shader), dual-source blending, or a colour pass plus a mask pass.
+* Not bit-identical with the software renderer (edges, interpolation rounding): 0–2% of pixels
+  differ at 4x on the reference race. Mask-checked drawing needs framebuffer fetch.
+
+At 4x on the PC it is about 3x faster than the software renderer. It is what lets an Android TV
+with four Cortex-A55 cores (Sony BRAVIA, Mali-G52) run CTR at 2x and full speed.
+
 ## Widescreen
 
 Three aspect modes, cycled with F9 or a left-stick click (`--aspect 4:3|16:9|fill`):
@@ -157,6 +179,12 @@ fps. `--overclock 100..400` (or `overclock=` in `ctr.cfg`; 0 = auto) sets it exp
 * `-DRECOMP_CHECK_CALLS=ON` builds report callee-saved register clobbers and support
   `--watch-addr` / `--watch-value` store watchpoints.
 * `--prim-log`: per-frame primitive buffer usage. `-v`: verbose log (CD, BIOS, SPU levels).
+* `tools/verify.ps1`: checks that screenshots (1x, 4x, 16:9) and the audio (`--audio-dump`) are
+  byte-identical to the reference runs. `tools/imgdiff.py` compares screenshot sets (e.g. GPU vs
+  software renderer).
+* `--host-sample A B`: samples the host instruction pointer during frames A..B;
+  `tools/host_profile.py` symbolizes it to source lines, generated code included.
+* `--display N` (or `CTR_DISPLAY=N`): open the window on monitor N.
 * Crashes print a host backtrace (`tools/symbolize.sh build/run_err.txt`) and dump RAM to
   `build/crash_ram.bin`.
 

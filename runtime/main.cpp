@@ -632,11 +632,14 @@ int main(int argc, char** argv) {
 #endif
         return 1;
     }
-    // defaults: 4x internal resolution with sub-pixel vertices; on phones 2x and filling the
-    // screen (ctr.cfg and options override)
+    // defaults: 4x internal resolution with sub-pixel vertices; on phones and TVs 2x filling
+    // the screen, drawn by the GPU, with the CPU at 400% so busy scenes keep full speed
+    // (ctr.cfg and options override)
 #ifdef __ANDROID__
     gpu_set_scale(2);
     aspect_mode = ASPECT_FILL;
+    want_gl = true;
+    overclock_setting = 400;
 #else
     gpu_set_scale(4);
 #endif
