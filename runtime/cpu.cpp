@@ -258,13 +258,17 @@ void interp_run(CPU* c, uint32_t pc, uint32_t stop) {
         rt_cyc(c, insn_cycles(dw));
         interp_exec_simple(c, dw, at + 4);
     };
+    bool no_flat = false;  // the compiled region declined this pc: interpret one instruction
     for (;;) {
         // compiled region: runs until it leaves the region or interp_run would return
-        if (pc - g_flat_lo < g_flat_span) {
+        if (no_flat) {
+            no_flat = false;
+        } else if (pc - g_flat_lo < g_flat_span) {
             if (const FlatRegion* fr = flat_find(pc)) {
                 int done = 0;
                 pc = fr->fn(c, pc, stop, &depth, &done);
-                if (done) return;
+                if (done == 1) return;
+                if (done == 2) no_flat = true;  // not an entry point of its compiled code
                 continue;
             }
         }
@@ -516,6 +520,18 @@ int rt_flat_nonlocal_needed(uint32_t target) {
     return 0;
 }
 int rt_is_func_entry(uint32_t t) { return is_func_entry(t) ? 1 : 0; }
+
+// Compiled regions decline addresses that are not entry points of their code (and chunks
+// that hold the stop address); the interpreter runs those instructions. Exact either way,
+// but slow if frequent: the first few addresses are logged, the total goes to the profile.
+uint64_t g_flat_misses = 0, g_flat_stop_misses = 0;
+void rt_flat_miss(uint32_t pc, int stop_in_chunk) {
+    g_flat_misses++;
+    if (stop_in_chunk) { g_flat_stop_misses++; return; }
+    static std::unordered_map<uint32_t, uint64_t> seen;
+    if (seen.size() < 32 && seen.find(pc) == seen.end()) LOGI("flat: %08x is not a compiled entry point", pc);
+    seen[pc]++;
+}
 
 void rt_check_events(CPU* c) {
     if (g_in_verify) { c->next_event = INT64_MAX; return; }  // comparisons run without events

@@ -17,6 +17,7 @@
 
 extern "C" FILE* g_trace_file;
 extern "C" long long g_break_cycles;
+extern "C" uint64_t g_flat_misses, g_flat_stop_misses;
 
 namespace psx {
 
@@ -374,6 +375,9 @@ void frontend_poll_input() {
 // frames A..B and prints the hottest addresses at exit (accurate with --interp, where every
 // instruction updates c->pc; recompiled code does not)
 static uint64_t pc_sample_from = 0, pc_sample_to = 0;
+static uint64_t host_sample_from = 0, host_sample_to = 0;
+void host_prof_start(const volatile uint64_t* frame, uint64_t from, uint64_t to);
+void host_prof_report();
 static std::atomic<bool> pc_sample_stop{false};
 static std::unordered_map<uint32_t, uint64_t> pc_samples;
 static void pc_sampler_start() {
@@ -495,6 +499,8 @@ void frontend_vblank() {
                  (unsigned long long)g_gpu_stall_why[2], (unsigned long long)g_gpu_stall_why[3]);
             memset(g_gpu_stall_why, 0, sizeof g_gpu_stall_why);
             LOGI("profile: spu %.2f ms/frame (%s)", g_spu_ns.exchange(0) / 1e6 / 300, g_spu_thread ? "audio thread" : "inline");
+            LOGI("profile: compiled regions declined %llu instructions (%llu stop address)", (unsigned long long)g_flat_misses, (unsigned long long)g_flat_stop_misses);
+            g_flat_misses = g_flat_stop_misses = 0;
             LOGI("profile: gpu sync wait %.2f ms/frame (incl. vblank), queue full %.2f ms/frame, vram copies %.1f/frame",
                  g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
             // the game's own frame rate: display buffer flips per 300 vblanks (emulated time)
@@ -521,6 +527,7 @@ void frontend_vblank() {
         frontend_poll_input();
         if (g_quit) {
             pc_sampler_report();
+            host_prof_report();
             spu_flush();
             if (g_audio_dump) fclose(g_audio_dump);
             bios_flush_cards();
@@ -639,6 +646,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--audio-dump") && i + 1 < argc) g_audio_dump = fopen(argv[++i], "wb");
         else if (!strcmp(argv[i], "--no-idle-skip")) g_idle_skip = 0;
         else if (!strcmp(argv[i], "--no-spu-thread")) g_spu_thread = false;
+        else if (!strcmp(argv[i], "--host-sample") && i + 2 < argc) {
+            host_sample_from = strtoull(argv[++i], nullptr, 10);
+            host_sample_to = strtoull(argv[++i], nullptr, 10);
+        }
         else if (!strcmp(argv[i], "--pc-sample") && i + 2 < argc) {
             pc_sample_from = strtoull(argv[++i], nullptr, 10);
             pc_sample_to = strtoull(argv[++i], nullptr, 10);
@@ -751,6 +762,7 @@ int main(int argc, char** argv) {
 
     g_spu_profile = profile;
     pc_sampler_start();
+    host_prof_start(&frame_counter, host_sample_from, host_sample_to);
     hw_init();
     cpu_init();
     gpu_init();

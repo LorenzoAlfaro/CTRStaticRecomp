@@ -231,6 +231,7 @@ void rt_flat_exec(CPU* c, uint32_t w, uint32_t pc);  // one non-control instruct
 void rt_flat_exec_delay(CPU* c, uint32_t at);        // the delay slot after at (read from memory)
 void rt_flat_nonlocal(uint32_t target);
 int rt_flat_nonlocal_needed(uint32_t target);  // would rt_flat_nonlocal longjmp? (no side effects)
+void rt_flat_miss(uint32_t pc, int stop_in_chunk);  // a compiled region declined pc (statistics)
 int rt_is_func_entry(uint32_t t);
 
 // Enhancement hooks (runtime/hooks.cpp): the recompiler emits a call before each

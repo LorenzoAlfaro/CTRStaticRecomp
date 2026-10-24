@@ -143,12 +143,65 @@ def simple(w, a):
 
 
 CHUNK = 256  # instructions per generated C function (huge functions compile very slowly)
+# Sparse entry points (default): only addresses execution can arrive at get a label (see
+# entry_points); RECOMP_FLAT_DENSE=1 labels every instruction and checks the stop address at
+# each one, like the interpreter loop does.
+import os
+DENSE = os.environ.get("RECOMP_FLAT_DENSE") == "1"
+
+
+def control_target(a, w):
+    """Constant target of a branch / j / jal at a, or None."""
+    op = w >> 26
+    if op in (0x02, 0x03):
+        return ((a + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
+    if op == 0x01 or 0x04 <= op <= 0x07:
+        return (a + 4 + (s16(w & 0xFFFF) << 2)) & 0xFFFFFFFF
+    return None
+
+
+def entry_points(modules, regs):
+    """Addresses where execution can enter or continue in a region other than by falling
+    through from the previous instruction: constant branch/jump targets anywhere in the game,
+    the instruction after every control instruction's delay slot (call returns, untaken
+    branches), every word of code or data whose value points into a region (jump tables,
+    continuation addresses, function pointers) and lui+addiu/ori address constants. Any
+    other arrival (an indirect jump to an address none of these found) is still exact: the
+    region declines it and the interpreter runs that instruction."""
+    def in_any(v):
+        return any(rg.lo <= v < rg.hi for rg in regs) and not (v & 3)
+    out = set()
+    for m in modules:
+        n = len(m.data) // 4
+        words = struct.unpack_from(f"<{n}I", m.data, 0)
+        hi_reg = {}  # register -> (lui value, index) for address constants
+        for i, w in enumerate(words):
+            a = m.base + 4 * i
+            if in_any(w):
+                out.add(w)
+            if is_control(w):
+                t = control_target(a, w)
+                if t is not None and in_any(t):
+                    out.add(t)
+                out.add(a + 8)
+            op = w >> 26
+            if op == 0x0F:
+                hi_reg[(w >> 16) & 31] = ((w & 0xFFFF) << 16, i)
+            elif op in (0x09, 0x0D):  # addiu / ori rt, rs, imm after lui rs
+                rs = (w >> 21) & 31
+                if rs in hi_reg and i - hi_reg[rs][1] <= 8:
+                    base = hi_reg[rs][0]
+                    v = (base + s16(w & 0xFFFF)) & 0xFFFFFFFF if op == 0x09 else base | (w & 0xFFFF)
+                    if in_any(v):
+                        out.add(v)
+    return out
 
 
 class FlatRegion:
     def __init__(self, name, lo, hi, words, ovr):
         self.name, self.lo, self.hi, self.words, self.ovr = name, lo, hi, words, ovr
         self.clo, self.chi = lo, hi  # the chunk being emitted
+        self.entries = set()  # entry points (all regions), see entry_points
 
     def word(self, a):
         return self.words[(a - self.lo) >> 2]
@@ -260,11 +313,15 @@ class FlatRegion:
         # instruction bodies first: the register set the chunk uses decides its prologue
         reg_ref = re.compile(r"\br\[(\d+)\]")
         lines = []
+        labels = []
         for k in range(n):
             a = self.clo + 4 * k
             w = self.word(a)
-            lines.append(f"L_{a:08X}:")
-            lines.append(f"    if (sic && stop == {a:#010x}u) {{ if (depth == 0) FINISH(); depth--; }}")
+            if DENSE or a == self.clo or a in self.entries:
+                labels.append(a)
+                lines.append(f"L_{a:08X}:")
+            if DENSE:
+                lines.append(f"    if (sic && stop == {a:#010x}u) {{ if (depth == 0) FINISH(); depth--; }}")
             body = self.control(a, w) if is_control(w) else simple(w, a)
             pc_set = f"c->pc = {a:#010x}u; " if is_control(w) else ""
             lines.append(reg_ref.sub(r"R\1", f"    {pc_set}n += {insn_cycles(w)}; {body}"))
@@ -295,17 +352,27 @@ class FlatRegion:
         o.append(f"    const int sic = stop - {self.clo:#010x}u < {self.chi - self.clo:#x}u;")
         o.append("#define FLUSH() do { if (n) { rt_cyc(c, n); n = 0; } } while (0)")
         o.append("#define FINISH() do { FLUSH(); SPILL(); *dp = depth; *done = 1; return 0; } while (0)")
+        if not DENSE:
+            # Without per-instruction stop checks the compiled code is only valid while the
+            # stop address cannot be reached in this chunk; otherwise, and at an address that
+            # is not an entry point, decline: the interpreter runs the next instruction.
+            o.append("#define DECLINE() do { FLUSH(); SPILL(); *dp = depth; *done = 2; rt_flat_miss(pc, sic); return pc; } while (0)")
+            o.append("    if (sic) DECLINE();")
         o.append("    goto dispatch;")
         o.append(text)
         o.append(f"    pc = {self.chi:#010x}u;")
         o.append("dispatch:")
         o.append(f"    if (pc - {self.clo:#010x}u < {self.chi - self.clo:#x}u && !(pc & 3)) {{")
         o.append(f"        switch ((pc - {self.clo:#010x}u) >> 2) {{")
-        for k in range(n):
-            o.append(f"        case {k}: goto L_{self.clo + 4 * k:08X};")
+        for a in labels:
+            o.append(f"        case {(a - self.clo) >> 2}: goto L_{a:08X};")
         o.append("        }")
+        if not DENSE:
+            o.append("        DECLINE();")
         o.append("    }")
         o.append("    FLUSH(); SPILL(); *dp = depth; *done = 0; return pc;")
+        if not DENSE:
+            o.append("#undef DECLINE")
         o.append("#undef FINISH")
         o.append("#undef FLUSH")
         o.append("#undef CHK")
@@ -326,7 +393,8 @@ class FlatRegion:
         o.append(f"uint32_t {self.name}(CPU* c, uint32_t pc, uint32_t stop, int* dp, int* done) {{")
         o.append(f"    while (pc - {self.lo:#010x}u < {self.hi - self.lo:#x}u && !(pc & 3)) {{")
         o.append(f"        pc = {self.name}_chunks[(pc - {self.lo:#010x}u) / {CHUNK * 4}](c, pc, stop, dp, done);")
-        o.append("        if (*done) return 0;")
+        o.append("        if (*done == 1) return 0;")
+        o.append("        if (*done == 2) return pc;  // declined: the interpreter runs this instruction")
         o.append("    }")
         o.append("    *done = 0;")
         o.append("    return pc;")
@@ -344,6 +412,10 @@ def regions(main_mod, modules, interp_only_main, interp_only_overlays):
             lo, hi = m.base, m.base + (len(m.data) & ~3)
             words = [struct.unpack_from("<I", m.data, a - m.base)[0] for a in range(lo, hi, 4)]
             out.append(FlatRegion(f"FLAT_{m.ovr}_{lo:08X}", lo, hi, words, m.ovr))
+    if not DENSE:
+        entries = entry_points([main_mod] + list(modules), out)
+        for rg in out:
+            rg.entries = entries
     return out
 
 
