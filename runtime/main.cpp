@@ -241,7 +241,17 @@ static void controller_hotkeys() {
 // pad plugged in only while player 2 has one, so with one controller the game sees exactly what
 // it did before. --players 1|2 overrides; scripted runs (--keys) default to 1 player.
 static int players_opt = 0;
+// A real gamepad has analog axes on the device itself: SDL gives every Android input device a
+// default mapping with sticks and face buttons, a TV remote's receiver included, and that one is
+// listed before the pads (it took player 1 and pushed the pad to player 2). Remote-like names
+// are excluded too.
 static bool is_player_pad(SDL_GameController* g) {
+    SDL_Joystick* j = SDL_GameControllerGetJoystick(g);
+    if (!j || SDL_JoystickNumAxes(j) < 2 || SDL_JoystickNumButtons(j) < 4) return false;
+    std::string name = SDL_GameControllerName(g) ? SDL_GameControllerName(g) : "";
+    for (char& ch : name) ch = (char)tolower((unsigned char)ch);
+    for (const char* bad : {"remote", " ir ", "ir receiver", "vrc", "keypad", "virtual-search", "cec"})
+        if (name.find(bad) != std::string::npos) return false;
     return SDL_GameControllerHasAxis(g, SDL_CONTROLLER_AXIS_LEFTX) && SDL_GameControllerHasAxis(g, SDL_CONTROLLER_AXIS_LEFTY) &&
            SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_A) && SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_X) &&
            SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_Y);
@@ -277,7 +287,9 @@ static void remote_exit(const uint8_t* k) {
 }
 
 // PS1 buttons pressed on a gamepad (active low bits cleared in b)
-static void gamepad_buttons(SDL_GameController* gamepad, uint16_t& b) {
+// (axes = false: buttons only, for devices that are not gamepads, whose default mapping may
+// report a stuck axis)
+static void gamepad_buttons(SDL_GameController* gamepad, uint16_t& b, bool axes = true) {
     auto press = [&](int bit) { b &= ~(1u << bit); };
     auto btn = [&](SDL_GameControllerButton sb, int bit) { if (SDL_GameControllerGetButton(gamepad, sb)) press(bit); };
     btn(SDL_CONTROLLER_BUTTON_BACK, 0);
@@ -292,6 +304,7 @@ static void gamepad_buttons(SDL_GameController* gamepad, uint16_t& b) {
     btn(SDL_CONTROLLER_BUTTON_B, 13);
     btn(SDL_CONTROLLER_BUTTON_A, 14);
     btn(SDL_CONTROLLER_BUTTON_X, 15);
+    if (!axes) return;
     if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000) press(8);
     if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000) press(9);
     int lx = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTX);
@@ -328,14 +341,23 @@ static void update_pad() {
     SDL_GameController* p2_pad = nullptr;
     int player_pads = 0;
     for (SDL_GameController* gamepad : gamepads) {
-        if (is_player_pad(gamepad) && player_pads++ == 1 && max_players >= 2) {
+        bool pad = is_player_pad(gamepad);
+        if (pad && player_pads++ == 1 && max_players >= 2) {
             p2_pad = gamepad;
             gamepad_buttons(gamepad, b2);
         } else {
-            gamepad_buttons(gamepad, b);  // player 1 (or a third pad, which joins player 1)
+            gamepad_buttons(gamepad, b, pad);  // player 1 (or a third pad, which joins player 1)
         }
     }
     remote_exit(k);
+    static SDL_GameController* logged_p1 = nullptr;
+    SDL_GameController* p1_pad = nullptr;
+    for (SDL_GameController* gamepad : gamepads)
+        if (is_player_pad(gamepad)) { p1_pad = gamepad; break; }
+    if (p1_pad != logged_p1) {
+        logged_p1 = p1_pad;
+        if (p1_pad) LOGI("player 1: %s", SDL_GameControllerName(p1_pad));
+    }
     bool p2 = p2_pad != nullptr || players_opt == 2;
     if (p2 != g_pads[1].connected) {
         if (p2) LOGI("player 2: %s", p2_pad ? SDL_GameControllerName(p2_pad) : "(no controller, --players 2)");
