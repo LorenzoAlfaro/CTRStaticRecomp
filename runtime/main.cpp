@@ -244,6 +244,35 @@ static bool is_player_pad(SDL_GameController* g) {
            SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_Y);
 }
 
+// Exit: hold Back on a TV remote (or the keyboard's AC Back key) for a second. Android reports a
+// TV's remote as a game controller, so its Back key arrives as a controller button (B or Back)
+// and a short press stays the game's Circle (menu back); only holding it quits.
+static void remote_exit(const uint8_t* k) {
+    static uint32_t held_since = 0;
+    static bool logged[64] = {};
+    bool back = k[SDL_SCANCODE_AC_BACK] != 0;
+    for (size_t i = 0; i < gamepads.size(); i++) {
+        SDL_GameController* g = gamepads[i];
+        if (is_player_pad(g)) continue;
+        for (int bt = 0; bt < SDL_CONTROLLER_BUTTON_MAX; bt++) {
+            if (!SDL_GameControllerGetButton(g, (SDL_GameControllerButton)bt)) continue;
+            if (i < 4 && !logged[i * 16 + (bt & 15)]) {  // which remote buttons arrive (first press each)
+                logged[i * 16 + (bt & 15)] = true;
+                LOGI("remote '%s': button %s", SDL_GameControllerName(g),
+                     SDL_GameControllerGetStringForButton((SDL_GameControllerButton)bt));
+            }
+            if (bt == SDL_CONTROLLER_BUTTON_B || bt == SDL_CONTROLLER_BUTTON_BACK) back = true;
+        }
+    }
+    uint32_t now = SDL_GetTicks();
+    if (!back) { held_since = 0; return; }
+    if (!held_since) held_since = now ? now : 1;
+    if (now - held_since >= 1000) {
+        LOGI("Back held: exiting");
+        g_quit = true;
+    }
+}
+
 // PS1 buttons pressed on a gamepad (active low bits cleared in b)
 static void gamepad_buttons(SDL_GameController* gamepad, uint16_t& b) {
     auto press = [&](int bit) { b &= ~(1u << bit); };
@@ -303,6 +332,7 @@ static void update_pad() {
             gamepad_buttons(gamepad, b);  // player 1 (or a third pad, which joins player 1)
         }
     }
+    remote_exit(k);
     bool p2 = p2_pad != nullptr || players_opt == 2;
     if (p2 != g_pads[1].connected) {
         if (p2) LOGI("player 2: %s", p2_pad ? SDL_GameControllerName(p2_pad) : "(no controller, --players 2)");
@@ -763,6 +793,8 @@ int main(int argc, char** argv) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     // phones: don't expose the accelerometer as a joystick (tilting would press the D-pad)
     SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+    // Android: deliver the Back key to the game (held on a TV remote = exit, see remote_exit)
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
