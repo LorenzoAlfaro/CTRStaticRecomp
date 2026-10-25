@@ -159,6 +159,7 @@ static void ev_vblank(int64_t t) {
     frames++;
     frame_debug_hooks();
     spu_run_until(t);
+    spu_kick();
     frontend_vblank();
     schedule(EV_VBLANK_END, line_cycle(frame_start_cycle, LINES_PER_FRAME));
 }

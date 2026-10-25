@@ -114,6 +114,7 @@ extern bool g_spu_profile;   // time the mixing (--profile)
 extern std::atomic<int64_t> g_spu_ns;
 extern bool g_spu_thread;     // mix on an audio thread (--no-spu-thread: inline)
 void spu_flush();             // wait for the audio thread to catch up
+void spu_kick();              // frame end: let the audio thread mix what is pending
 extern FILE* g_audio_dump;   // --audio-dump: raw 44.1 kHz stereo s16 output
 
 // ---- CD-ROM -------------------------------------------------------------------------

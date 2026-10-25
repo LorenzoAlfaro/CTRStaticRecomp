@@ -21,6 +21,8 @@ typedef char GLchar;
 typedef unsigned char GLubyte;
 typedef ptrdiff_t GLsizeiptr;
 typedef ptrdiff_t GLintptr;
+typedef struct __GLsync* GLsync;
+typedef uint64_t GLuint64;
 
 enum : GLenum {
     GL_NO_ERROR = 0,
@@ -47,6 +49,7 @@ enum : GLenum {
     GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
     GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
     GL_MAX_TEXTURE_SIZE = 0x0D33,
+    GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117, GL_SYNC_FLUSH_COMMANDS_BIT = 0x1,
 };
 
 namespace psx {
@@ -111,7 +114,10 @@ namespace psx {
     X(void, glUniform4f, (GLint loc, GLfloat a, GLfloat b, GLfloat c, GLfloat d))                        \
     X(void, glDrawArrays, (GLenum mode, GLint first, GLsizei n))                                         \
     X(void, glFlush, (void))                                                                             \
-    X(void, glFinish, (void))
+    X(void, glFinish, (void))                                                                            \
+    X(GLsync, glFenceSync, (GLenum cond, GLbitfield flags))                                              \
+    X(GLenum, glClientWaitSync, (GLsync s, GLbitfield flags, GLuint64 timeout))                          \
+    X(void, glDeleteSync, (GLsync s))
 
 #define GL_DECLARE(ret, name, args) typedef ret(GLAPIENTRY* PFN_##name) args; extern PFN_##name name;
 GL_FUNCS(GL_DECLARE)

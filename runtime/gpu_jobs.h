@@ -1,6 +1,7 @@
 // Render jobs: what the GPU command decoder (gpu.cpp, emulation thread) hands to the
 // renderers, the software rasterizer's worker threads or the OpenGL ES thread (gpu_gl.cpp).
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -67,6 +68,7 @@ void gl_run_job(const Job& j);
 void gl_idle();                   // queue empty: send pending drawing to the GPU
 void gl_stats_line(char* out, size_t size, int frames);  // profile line, resets the counters
 extern uint16_t* g_gl_mirror;     // JOB_READBACK target (native 1024x512)
+extern std::atomic<uint64_t> g_gl_presents_done;  // frames shown by the GL thread
 extern int g_gl_shift;            // log2 of the GL renderer's internal resolution
 
 // frontend side (gpu.cpp)

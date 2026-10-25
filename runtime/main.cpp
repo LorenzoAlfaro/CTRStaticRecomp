@@ -44,6 +44,7 @@ static void output_size(int& w, int& h) {
 static SDL_Texture* texture = nullptr;
 static int tex_w = 0, tex_h = 0;
 static SDL_AudioDeviceID audio_dev = 0;
+static std::atomic<uint64_t> g_audio_empty{0};  // audio device ran dry (profiling)
 // every connected controller is read and their inputs combined: devices SDL has a mapping
 // for use the standard layout, others (e.g. vJoy, DirectInput pads without a mapping) a
 // generic one
@@ -485,6 +486,15 @@ void frontend_vblank() {
     frame_counter++;
     static double p_last = 0, p_sync = 0, p_conv = 0, p_present = 0;
     double t0 = now_seconds();
+    // real-time refresh intervals (profiling): the worst one and how many were long
+    static double last_vb = 0, worst_vb = 0;
+    static int long_vb = 0;
+    if (last_vb > 0) {
+        double dt = t0 - last_vb;
+        worst_vb = std::max(worst_vb, dt);
+        if (dt > 0.025) long_vb++;
+    }
+    last_vb = t0;
     display_size(frame_w, frame_h);
     bool new_texture = false;
     if (!gl_on && (!texture || frame_w > tex_w || frame_h > tex_h)) {
@@ -575,6 +585,12 @@ void frontend_vblank() {
             LOGI("profile: spu %.2f ms/frame (%s)", g_spu_ns.exchange(0) / 1e6 / 300, g_spu_thread ? "audio thread" : "inline");
             if (gl_on) { char gls[320]; gl_stats_line(gls, sizeof gls, 300); LOGI("profile: %s", gls); }
             LOGI("profile: compiled regions declined %llu instructions (%llu stop address)", (unsigned long long)g_flat_misses, (unsigned long long)g_flat_stop_misses);
+            extern uint64_t g_spu_drains, g_gl_readbacks;
+            extern int64_t g_spu_drain_ns;
+            LOGI("profile: real time: worst refresh %.1f ms, %d over 25 ms; audio thread waits %llu (%.2f ms); vram reads %llu; audio ran dry %llu", worst_vb * 1000, long_vb,
+                 (unsigned long long)g_spu_drains, g_spu_drain_ns / 1e6, (unsigned long long)g_gl_readbacks, (unsigned long long)g_audio_empty.exchange(0));
+            worst_vb = 0; long_vb = 0; g_spu_drains = 0; g_spu_drain_ns = 0; g_gl_readbacks = 0;
+            last_vb = 0;  // (not the time spent printing this)
             g_flat_misses = g_flat_stop_misses = 0;
             LOGI("profile: gpu sync wait %.2f ms/frame (incl. vblank), queue full %.2f ms/frame, vram copies %.1f/frame",
                  g_gpu_wait_s * 1000 / 300, g_gpu_full_s * 1000 / 300, g_gpu_copies / 300.0);
@@ -647,6 +663,14 @@ void frontend_vblank() {
 void frontend_audio(const int16_t* stereo, int frames) {
     if (!audio_dev || fast_forward) return;
     uint32_t queued = SDL_GetQueuedAudioSize(audio_dev);
+    if (queued == 0) {
+        // the device ran dry (an audible gap; also at startup): queue ~23 ms of silence ahead
+        // of the sound, a margin that then stays (sound is made at the rate it is played) and
+        // absorbs the jitter of the audio thread and the frame pacing
+        g_audio_empty++;
+        static const std::vector<int16_t> silence(1024 * 2, 0);
+        SDL_QueueAudio(audio_dev, silence.data(), (uint32_t)silence.size() * 2);
+    }
     if (queued > 44100 * 4 / 5) return;  // > 200 ms behind: drop
     SDL_QueueAudio(audio_dev, stereo, frames * 4);
 }

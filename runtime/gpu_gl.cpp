@@ -48,6 +48,7 @@ SDL_Window* g_gl_window = nullptr;
 SDL_GLContext g_gl_context = nullptr;
 int g_gl_shift = 0;  // log2 of the internal resolution scale
 uint16_t* g_gl_mirror = nullptr;
+std::atomic<uint64_t> g_gl_presents_done{0};
 
 static int gsh = 0, S = 1, VW = 1024, VH = 512;
 static GLuint tex_draw = 0, tex_read = 0, tex_stage = 0;
@@ -918,6 +919,16 @@ static void present(const PresentInfo& p) {
         glDrawArrays(GL_TRIANGLES, 0, 6);
     }
     SDL_GL_SwapWindow(g_gl_window);
+    // at most one frame queued on the GPU: wait for the previous one to finish (otherwise a
+    // GPU that is slower than real time builds up frames, and input delay with them)
+    static GLsync prev = nullptr;
+    GLsync f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (prev) {
+        glClientWaitSync(prev, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);  // 100 ms at most
+        glDeleteSync(prev);
+    }
+    prev = f;
+    g_gl_presents_done.fetch_add(1, std::memory_order_release);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
 }
 

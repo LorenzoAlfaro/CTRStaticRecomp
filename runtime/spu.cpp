@@ -59,9 +59,33 @@ static bool reverb_odd = false;
 static int32_t reverb_out_l = 0, reverb_out_r = 0;
 
 // CD audio input ring buffer (44.1 kHz stereo)
-static std::vector<int16_t> cd_buf(44100 * 2 * 2);
-static size_t cd_rd = 0, cd_wr = 0;
-static double cd_frac = 0;
+struct CdRing {
+    std::vector<int16_t> buf = std::vector<int16_t>(44100 * 2 * 2);
+    size_t rd = 0, wr = 0;
+    double frac = 0;
+    int16_t last_l = 0, last_r = 0;
+    void push(const int16_t* stereo, int frames, int rate);
+    void pop(int32_t& l, int32_t& r) {
+        l = r = 0;
+        if (rd == wr) return;
+        l = buf[rd];
+        r = buf[rd + 1];
+        rd += 2;
+        if (rd == buf.size()) rd = 0;
+    }
+};
+// The mixer's ring, and with the audio thread an identical one on the CPU side: CTR reads the
+// CD capture buffers (SPU RAM 0x000-0x7FF) back by DMA a few times per frame, and their
+// contents depend only on the CD input and the sample clock, so the CPU side keeps its own
+// copy of them (cap_cpu) and answers those reads without waiting for the mixer.
+static CdRing cd_mix, cd_cpu;
+static int16_t cap_cpu[0x400];  // SPU RAM 0x000..0x7FF (CD left, CD right capture buffers)
+// set for good once reverb writes may reach that area (the only other mixer writes there)
+static bool cap_unsafe = false;
+static inline void cap_set(uint32_t a, int16_t v) {  // a CPU write to SPU RAM
+    a &= 0x7FFFE;
+    if (a < 0x800) cap_cpu[a >> 1] = v;
+}
 
 static std::vector<int16_t> out_buf;
 
@@ -305,12 +329,7 @@ static void sample_tick() {
 
     // CD audio input
     int32_t cd_l = 0, cd_r = 0;
-    if (cd_rd != cd_wr) {
-        cd_l = cd_buf[cd_rd];
-        cd_r = cd_buf[cd_rd + 1];
-        cd_rd += 2;
-        if (cd_rd == cd_buf.size()) cd_rd = 0;
-    }
+    cd_mix.pop(cd_l, cd_r);
     // capture buffers (CD L/R, voice 1, voice 3)
     ram16_set(0x000 + capture_pos * 2, (int16_t)cd_l);
     ram16_set(0x400 + capture_pos * 2, (int16_t)cd_r);
@@ -408,27 +427,27 @@ static void mixer_write(uint32_t off, uint16_t v) {
     }
 }
 
-static void cd_push(const int16_t* stereo, int frames, int rate) {
+void CdRing::push(const int16_t* stereo, int frames, int rate) {
     // resample to 44.1 kHz (linear) into the ring buffer
     double step = (double)rate / 44100.0;
-    static int16_t last_l = 0, last_r = 0;
-    double pos = cd_frac;
+    double pos = frac;
     while (pos < frames) {
         int i = (int)pos;
         double f = pos - i;
         int16_t l0 = i == 0 ? last_l : stereo[2 * (i - 1)], r0 = i == 0 ? last_r : stereo[2 * (i - 1) + 1];
         int16_t l1 = stereo[2 * i], r1 = stereo[2 * i + 1];
-        size_t next = (cd_wr + 2) % cd_buf.size();
-        if (next == cd_rd) break;  // full
-        cd_buf[cd_wr] = (int16_t)(l0 + (l1 - l0) * f);
-        cd_buf[cd_wr + 1] = (int16_t)(r0 + (r1 - r0) * f);
-        cd_wr = next;
+        size_t next = (wr + 2) % buf.size();
+        if (next == rd) break;  // full
+        buf[wr] = (int16_t)(l0 + (l1 - l0) * f);
+        buf[wr + 1] = (int16_t)(r0 + (r1 - r0) * f);
+        wr = next;
         pos += step;
     }
-    cd_frac = pos - frames;
+    frac = pos - frames;
     last_l = stereo[2 * (frames - 1)];
     last_r = stereo[2 * (frames - 1) + 1];
 }
+static void cd_push(const int16_t* stereo, int frames, int rate) { cd_mix.push(stereo, frames, rate); }
 
 static void apply(const Cmd& c) {
     switch (c.kind) {
@@ -490,13 +509,28 @@ static void audio_thread() {
 }
 
 // wait until the mixer has caught up with the CPU side
+uint64_t g_spu_drains = 0;     // waits for the audio thread to catch up (profiling)
+int64_t g_spu_drain_ns = 0;
 static void drain() {
     if (!threaded) return;
     std::unique_lock<std::mutex> lk(mu);
+    auto caught_up = [] { return w_waiting && w_samples == target && cmds.empty(); };
+    if (caught_up()) return;
+    auto t0 = std::chrono::steady_clock::now();
+    g_spu_drains++;
     cv_work.notify_one();
-    cv_idle.wait(lk, [] { return w_waiting && w_samples == target && cmds.empty(); });
+    cv_idle.wait(lk, caught_up);
+    g_spu_drain_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 void spu_flush() { drain(); }
+// frame end: wake the mixer for whatever is pending, so no sound waits through the pause until
+// the next frame (the batching in spu_run_until would leave up to 256 samples, and the audio
+// device runs dry)
+void spu_kick() {
+    if (!threaded) return;
+    std::lock_guard<std::mutex> lk(mu);
+    if (w_waiting && target > w_samples) cv_work.notify_one();
+}
 
 // CPU-side IRQ check (transfers; the capture buffer when the mixer is threaded)
 static void irq_hit(uint32_t addr) {
@@ -523,6 +557,10 @@ void spu_run_until(int64_t cycles) {
     }
     for (uint64_t i = 0; i < n; i++) {
         uint32_t p = m_capture_pos * 2;
+        int32_t cl, cr;  // the CD input capture, as the mixer will write it for this sample
+        cd_cpu.pop(cl, cr);
+        cap_cpu[m_capture_pos] = (int16_t)cl;
+        cap_cpu[0x200 + m_capture_pos] = (int16_t)cr;
         irq_hit(p);
         irq_hit(0x400 + p);
         irq_hit(0x800 + p);
@@ -546,6 +584,8 @@ uint16_t spu_read16(uint32_t off) {
     off &= 0x3FE;
     if (off < 0x180 || off == 0x19C || off == 0x19E || (off >= 0x200 && off < 0x260)) {
         // mixer state: voice registers (envelope, repeat address), ENDX, voice output
+        static int logged = 0;
+        if (threaded && logged < 8) { logged++; LOGI("SPU: the game reads mixer register %03x (audio thread waits)", off); }
         drain();
         if (off == 0x19C) return (uint16_t)endx;
         if (off == 0x19E) return (uint16_t)(endx >> 16);
@@ -570,11 +610,16 @@ void spu_write16(uint32_t off, uint16_t v) {
     spu_run_until(now());
     off &= 0x3FE;
     mregs[off >> 1] = v;
+    if (!cap_unsafe && (mregs[0x1AA >> 1] & 0x80) && (uint32_t)mregs[0x1A2 >> 1] * 8 < 0x800) {
+        cap_unsafe = true;
+        LOGI("SPU: reverb area %05x reaches the capture buffers: capture reads wait for the mixer", mregs[0x1A2 >> 1] * 8);
+    }
     switch (off) {
     case 0x1A4: irq_addr = (uint32_t)v * 8; break;
     case 0x1A6: transfer_addr = (uint32_t)v * 8; break;
     case 0x1A8:
         irq_hit(transfer_addr);
+        cap_set(transfer_addr, (int16_t)v);
         post({0, CMD_RAM16, transfer_addr, v, {}});
         transfer_addr = (transfer_addr + 2) & 0x7FFFF;
         break;
@@ -593,12 +638,26 @@ void spu_dma_write(const uint32_t* src, int words) {
         irq_hit(transfer_addr);
         c.data[2 * i] = (int16_t)src[i];
         c.data[2 * i + 1] = (int16_t)(src[i] >> 16);
+        cap_set(transfer_addr, c.data[2 * i]);
+        cap_set(transfer_addr + 2, c.data[2 * i + 1]);
         transfer_addr = (transfer_addr + 4) & 0x7FFFF;
     }
     post(std::move(c));
 }
 
 void spu_dma_read(uint32_t* dst, int words) {
+    if (threaded && !cap_unsafe && (transfer_addr & 0x7FFFF) + (uint32_t)words * 4 <= 0x800) {
+        // the CD capture buffers: the CPU side's copy is current (no waiting for the mixer)
+        for (int i = 0; i < words; i++) {
+            irq_hit(transfer_addr);
+            uint32_t lo = (transfer_addr & 0x7FE) >> 1, hi = ((transfer_addr + 2) & 0x7FE) >> 1;
+            dst[i] = (uint16_t)cap_cpu[lo] | ((uint32_t)(uint16_t)cap_cpu[hi] << 16);
+            transfer_addr = (transfer_addr + 4) & 0x7FFFF;
+        }
+        return;
+    }
+    static int logged = 0;
+    if (threaded && logged < 8) { logged++; LOGI("SPU: DMA read of %d words at %05x (audio thread waits)", words, transfer_addr); }
     drain();
     for (int i = 0; i < words; i++) {
         irq_hit(transfer_addr);
@@ -608,6 +667,7 @@ void spu_dma_read(uint32_t* dst, int words) {
 }
 
 void spu_cd_audio(const int16_t* stereo, int frames, int rate) {
+    if (threaded) cd_cpu.push(stereo, frames, rate);  // the mixer applies the same push at this sample
     post({0, CMD_CD, (uint32_t)rate, 0, std::vector<int16_t>(stereo, stereo + (size_t)frames * 2)});
 }
 

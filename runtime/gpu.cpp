@@ -1048,6 +1048,8 @@ static void exec_command() {
             // VRAM lives on the graphics chip: read the area into the native mirror first
             Job j{};
             j.kind = JOB_READBACK;
+            extern uint64_t g_gl_readbacks;
+            g_gl_readbacks++;
             j.v[0].nx = download.x; j.v[0].ny = download.y;
             j.v[1].nx = download.w; j.v[1].ny = download.h;
             submit(j);
@@ -1328,11 +1330,20 @@ void gpu_use_gl() {
 bool gpu_gl() { return use_gl; }
 
 // OpenGL renderer: show the display area (and copy it for a screenshot: waits)
+uint64_t g_gl_readbacks = 0;  // CPU downloads from VRAM (profiling)
 void gpu_gl_present(const PresentInfo& p) {
     Job j{};
     j.kind = JOB_PRESENT;
     j.present = p;
     j.present.disp = gpu_display();
+    // at most one earlier frame still to be shown: when the GPU is slower than real time the
+    // game slows down instead of running ahead (frames piling up in the queue = input delay)
+    static uint64_t sent = 0;
+    while (sent > g_gl_presents_done.load(std::memory_order_acquire) + 1) {
+        wake_workers();
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    sent++;
     submit(j);
     if (p.shot) gpu_sync();
 }
