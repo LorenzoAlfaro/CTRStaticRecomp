@@ -10,5 +10,5 @@
   "targets": ["Windows"],
   "toolchain": "custom",
   "approach": "MIPS R3000A code translated to C at build time and linked with an HLE PS1 runtime (GTE, software or OpenGL ES GPU, SPU, CD-ROM); hand-written render asm is compiled into interpreter-exact C regions.",
-  "notes": "Menus and races play at full speed with music and XA audio. 4x internal resolution with sub-pixel vertices, 16:9 or full-window widescreen. Not yet: FMV (MDEC), analog pad, multiplayer beyond one controller."
+  "notes": "Menus and races play at full speed with music and XA audio. 4x internal resolution with sub-pixel vertices, 16:9 or full-window widescreen. Two players with two controllers (split screen). Not yet: FMV (MDEC), analog pad, 3-4 players (multitap)."
 }

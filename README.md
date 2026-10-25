@@ -96,9 +96,12 @@ Game controllers with an SDL mapping (Xbox/XInput, DualShock 4/DualSense, most c
 use the standard layout (A = Cross, B = Circle, X = Square, Y = Triangle). Joysticks without a
 mapping (e.g. vJoy) use a generic layout: button 0 = Cross, 1 = Circle, 2 = Square,
 3 = Triangle, 4/5 = L1/R1, 6/7 = L2/R2, 8 = Select, 9 = Start, stick/hat = D-pad.
-All connected controllers are read at once (their inputs are combined), so a virtual device like vJoy
-does not block a real pad. Detected devices are listed in `ctr.log`; controllers keep working
-when the window is not focused.
+**Two players:** the first gamepad is player 1 and the second is player 2 (CTR's VS. and Battle
+modes, split screen). The keyboard, generic joysticks such as vJoy, and devices that aren't
+gamepads (an Android TV's remote) always count as player 1, so a virtual device does not take
+player 2's place. With a single gamepad the second port stays empty, as on a PS1 with one pad.
+`--players 1|2` overrides. Detected devices and the player 2 assignment are listed in `ctr.log`;
+controllers keep working when the window is not focused.
 
 ## HD rendering
 
