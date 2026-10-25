@@ -241,6 +241,7 @@ static void controller_hotkeys() {
 // pad plugged in only while player 2 has one, so with one controller the game sees exactly what
 // it did before. --players 1|2 overrides; scripted runs (--keys) default to 1 player.
 static int players_opt = 0;
+static bool g_input_log = false;  // --input-log
 // A real gamepad has analog axes on the device itself: SDL gives every Android input device a
 // default mapping with sticks and face buttons, a TV remote's receiver included, and that one is
 // listed before the pads (it took player 1 and pushed the pad to player 2). Remote-like names
@@ -342,11 +343,29 @@ static void update_pad() {
     int player_pads = 0;
     for (SDL_GameController* gamepad : gamepads) {
         bool pad = is_player_pad(gamepad);
-        if (pad && player_pads++ == 1 && max_players >= 2) {
+        uint16_t mine = 0xFFFF;
+        bool to_p2 = pad && player_pads++ == 1 && max_players >= 2;
+        gamepad_buttons(gamepad, mine, pad);
+        if (to_p2) {
             p2_pad = gamepad;
-            gamepad_buttons(gamepad, b2);
+            b2 &= mine;
         } else {
-            gamepad_buttons(gamepad, b, pad);  // player 1 (or a third pad, which joins player 1)
+            b &= mine;  // player 1 (or a third pad, which joins player 1)
+        }
+        if (g_input_log) {
+            // --input-log: what each device presses, when it changes
+            static std::unordered_map<SDL_GameController*, uint16_t> last;
+            auto it = last.find(gamepad);
+            if (it == last.end() || it->second != mine) {
+                last[gamepad] = mine;
+                static const char* names[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
+                                                "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+                std::string list;
+                for (int bit = 0; bit < 16; bit++)
+                    if (!(mine & (1 << bit))) list += std::string(" ") + names[bit];
+                LOGI("input %06llu P%d %s:%s", (unsigned long long)frame_counter, to_p2 ? 2 : 1, SDL_GameControllerName(gamepad),
+                     list.empty() ? " (none)" : list.c_str());
+            }
         }
     }
     remote_exit(k);
@@ -804,6 +823,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) want_gl = !strcmp(argv[++i], "gl");
         else if (!strcmp(argv[i], "--display") && i + 1 < argc) win_display = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--players") && i + 1 < argc) players_opt = std::clamp(atoi(argv[++i]), 1, 2);
+        else if (!strcmp(argv[i], "--input-log")) g_input_log = true;
         else if (!strcmp(argv[i], "--gl-debug") && i + 1 < argc) g_gl_debug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gl-sync-budget") && i + 1 < argc) g_gl_sync_budget = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gl-exact")) g_gl_effect_snapshot = 0;
