@@ -52,6 +52,12 @@ std::atomic<uint64_t> g_gl_presents_done{0};
 
 static int gsh = 0, S = 1, VW = 1024, VH = 512;
 static GLuint tex_draw = 0, tex_read = 0, tex_stage = 0;
+// Texture reads (texture pages, CLUTs) only ever look at native pixels, so primitives sample a
+// native-resolution copy in 16-bit integers: no decoding in the shader, and at 2x and above a
+// texture's texels are next to each other instead of spread over the scaled texture.
+static GLuint tex_nat = 0, fbo_nat = 0, prog_pack = 0;
+static struct { GLint src, shift, flip; } upk;
+static void pack_native(int x0, int y0, int x1, int y1);
 static GLuint fbo_draw = 0, fbo_read = 0;
 static GLuint vao = 0, vbo = 0;
 static GLuint prog_draw = 0, prog_copy = 0, prog_present = 0;
@@ -94,7 +100,7 @@ void main() {
 )";
 
 static const char* kDrawFS = R"(
-uniform sampler2D u_vram;   // read copy of VRAM
+uniform highp usampler2D u_nat;  // native-resolution 16-bit copy of VRAM (texture reads)
 uniform int u_shift;        // log2(scale)
 uniform int u_pass;         // 0 all texels, 1 opaque texels only, 2 semi-transparent texels only,
                             // 3 single-pass blending (colour), 4 mask bits (alpha)
@@ -113,11 +119,7 @@ layout(location = 0, index = 1) out vec4 o1;  // background factor (dual-source 
 layout(location = 0) out vec4 o;
 #endif
 const int dither_tab[16] = int[16](-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2);
-uint fetch(int x, int y) {
-    vec4 c = texelFetch(u_vram, ivec2((x & 1023) << u_shift, u_flip - ((y & 511) << u_shift)), 0);
-    uvec4 k = uvec4(c * 255.0 + 0.5);
-    return (k.r >> 3) | ((k.g >> 3) << 5) | ((k.b >> 3) << 10) | (k.a > 127u ? 0x8000u : 0u);
-}
+uint fetch(int x, int y) { return texelFetch(u_nat, ivec2(x & 1023, y & 511), 0).r; }
 void main() {
 #ifdef DUAL
     o1 = vec4(0.0);
@@ -207,6 +209,24 @@ void main() {
         return;
     }
     o = vec4(col, (mask || mask_set) ? 1.0 : 0.0);  // pass 4 writes only this alpha (the mask bit)
+}
+)";
+
+// fills the native 16-bit copy from the drawn VRAM (top-left sample of each native pixel)
+static const char* kPackVS = R"(
+layout(location = 0) in vec2 a_pos;  // native pixels
+void main() { gl_Position = vec4(a_pos / vec2(1024.0, 512.0) * 2.0 - 1.0, 0.0, 1.0); }
+)";
+static const char* kPackFS = R"(
+uniform sampler2D u_src;
+uniform int u_shift;
+uniform int u_flip;
+layout(location = 0) out uint o;
+void main() {
+    ivec2 n = ivec2(gl_FragCoord.xy);  // native pixel; row y of the copy is VRAM row y
+    vec4 c = texelFetch(u_src, ivec2(n.x << u_shift, u_flip - (n.y << u_shift)), 0);
+    uvec4 k = uvec4(c * 255.0 + 0.5);
+    o = (k.r >> 3) | ((k.g >> 3) << 5) | ((k.b >> 3) << 10) | (k.a > 127u ? 0x8000u : 0u);
 }
 )";
 
@@ -325,11 +345,11 @@ static GLuint link(const char* vs, const char* fs, const char* fs_header = kHead
 }
 
 // ---- VRAM textures ------------------------------------------------------------------------
-static GLuint make_tex(int w, int h) {
+static GLuint make_tex(int w, int h, GLenum fmt = GL_RGBA8) {
     GLuint t;
     glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+    glTexStorage2D(GL_TEXTURE_2D, 1, fmt, w, h);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -375,6 +395,7 @@ static void set_scale(int shift) {
         glDeleteTextures(1, &old_read);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
+    pack_native(0, 0, 1024, 512);  // the native copy follows the new contents
     LOGI("GL: VRAM %dx%d", VW, VH);
 }
 
@@ -412,6 +433,28 @@ static bool dirty_test(Rgn r) {
 
 static uint64_t g_read_syncs = 0;
 static void flush();
+static void bind_vertices(const void* data, size_t bytes);
+
+// refresh the native 16-bit copy for native pixels [x0, x1) x [y0, y1) from the drawn VRAM
+static void pack_native(int x0, int y0, int x1, int y1) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_nat);
+    glViewport(0, 0, 1024, 512);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glUseProgram(prog_pack);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_draw);
+    glUniform1i(upk.src, 0);
+    glUniform1i(upk.shift, gsh);
+    glUniform1i(upk.flip, VH - 1);
+    float q[12] = {(float)x0, (float)y0, (float)x1, (float)y0, (float)x0, (float)y1,
+                   (float)x1, (float)y0, (float)x1, (float)y1, (float)x0, (float)y1};
+    struct P { float x, y, pad[5]; } v[6];  // the draw batches' vertex layout (position first)
+    for (int i = 0; i < 6; i++) { v[i] = P{}; v[i].x = q[2 * i]; v[i].y = q[2 * i + 1]; }
+    bind_vertices(v, sizeof v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
+}
 // bring the read copy up to date with everything drawn so far
 static void sync_read() {
     if (!dirty_any) return;
@@ -423,6 +466,7 @@ static void sync_read() {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_draw);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_read);
     glBlitFramebuffer(x0, ty0, x1, ty1, x0, ty0, x1, ty1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    pack_native(dirty_x0, dirty_y0, dirty_x1, dirty_y1);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
     memset(dirty_bits, 0, sizeof dirty_bits);
     dirty_any = false;
@@ -488,7 +532,7 @@ static void flush() {
     glUniform1i(ud.shift, gsh);
     glUniform1i(ud.flip, VH - 1);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_read);
+    glBindTexture(GL_TEXTURE_2D, tex_nat);
     glUniform1i(ud.vram, 0);
     bind_vertices(batch.data(), batch.size() * sizeof(GV));
     GLsizei n = (GLsizei)batch.size();
@@ -963,7 +1007,7 @@ bool gl_thread_init() {
     prog_present = link(kPresentVS, kPresentFS);
     if (!prog_draw || !prog_copy || !prog_present) return false;
     ud.size = glGetUniformLocation(prog_draw, "u_size");
-    ud.vram = glGetUniformLocation(prog_draw, "u_vram");
+    ud.vram = glGetUniformLocation(prog_draw, "u_nat");
     ud.shift = glGetUniformLocation(prog_draw, "u_shift");
     ud.pass = glGetUniformLocation(prog_draw, "u_pass");
     ud.flip = glGetUniformLocation(prog_draw, "u_flip");
@@ -1001,6 +1045,13 @@ bool gl_thread_init() {
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
     tex_stage = make_tex(1024, 512);
+    tex_nat = make_tex(1024, 512, GL_R16UI);
+    fbo_nat = make_fbo(tex_nat);
+    prog_pack = link(kPackVS, kPackFS);
+    if (!prog_pack) return false;
+    upk.src = glGetUniformLocation(prog_pack, "u_src");
+    upk.shift = glGetUniformLocation(prog_pack, "u_shift");
+    upk.flip = glGetUniformLocation(prog_pack, "u_flip");
     set_scale(g_gl_shift);
     return true;
 }
