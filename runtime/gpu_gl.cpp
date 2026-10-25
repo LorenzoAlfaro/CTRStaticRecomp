@@ -412,24 +412,51 @@ static void set_scale(int shift) {
 }
 
 // ---- dirty tracking (areas drawn since the read copy was refreshed) -------------------------
-// 16x8 native-pixel tiles, as in gpu.cpp's hazard tracking
-static uint64_t dirty_bits[64];
-static uint8_t dirty_cause[64][64];  // what made each tile stale: bit 0 drawing, 1 fill, 2 copy, 3 upload
+// 4x4 native-pixel tiles: CTR's effects read thin strips next to ones they just drew, and
+// coarser tiles made those look stale (each refresh costs the TV's tile-based GPU ~0.5 ms)
+constexpr int TW = 4, TH = 4, TX = 1024 / TW, TY = 512 / TH;
+static uint8_t dirty_cause[TY][TX];  // 0 current; else what made it stale: bit 0 drawing, 1 fill, 2 copy, 3 upload
+// Uploads write the native copy directly, so for them only the RGBA8 read copy (the source of
+// VRAM copies) is stale: primitives can read uploaded textures without a refresh.
+static uint8_t rgba_stale[TY][TX];
 static bool dirty_any = false;
-static int dirty_x0 = 1024, dirty_y0 = 512, dirty_x1 = 0, dirty_y1 = 0;
+static int dirty_x0 = 1024, dirty_y0 = 512, dirty_x1 = 0, dirty_y1 = 0;  // bounding box (native)
 
 static void dirty_mark(Rgn r, int cause) {
     r.x0 = std::max(r.x0, 0); r.y0 = std::max(r.y0, 0);
     r.x1 = std::min(r.x1, 1024); r.y1 = std::min(r.y1, 512);
     if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
-    for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
-        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++) {
-            dirty_bits[ty] |= 1ull << tx;
-            dirty_cause[ty][tx] |= (uint8_t)(1 << cause);
+    int tx0 = r.x0 / TW, tx1 = (r.x1 - 1) / TW;
+    for (int ty = r.y0 / TH; ty <= (r.y1 - 1) / TH; ty++)
+        for (int tx = tx0; tx <= tx1; tx++) dirty_cause[ty][tx] |= (uint8_t)(1 << cause);
+    dirty_any = true;
+    dirty_x0 = std::min(dirty_x0, tx0 * TW); dirty_y0 = std::min(dirty_y0, (r.y0 / TH) * TH);
+    dirty_x1 = std::max(dirty_x1, (tx1 + 1) * TW); dirty_y1 = std::max(dirty_y1, ((r.y1 - 1) / TH + 1) * TH);
+}
+// an upload: the RGBA8 read copy is stale; tiles it covers completely are current in the native copy
+static void upload_mark(Rgn r) {
+    r.x0 = std::max(r.x0, 0); r.y0 = std::max(r.y0, 0);
+    r.x1 = std::min(r.x1, 1024); r.y1 = std::min(r.y1, 512);
+    if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
+    for (int ty = r.y0 / TH; ty <= (r.y1 - 1) / TH; ty++)
+        for (int tx = r.x0 / TW; tx <= (r.x1 - 1) / TW; tx++) {
+            rgba_stale[ty][tx] = 1;
+            if (tx * TW >= r.x0 && (tx + 1) * TW <= r.x1 && ty * TH >= r.y0 && (ty + 1) * TH <= r.y1) dirty_cause[ty][tx] = 0;
         }
     dirty_any = true;
-    dirty_x0 = std::min(dirty_x0, r.x0 & ~15); dirty_y0 = std::min(dirty_y0, r.y0 & ~7);
-    dirty_x1 = std::max(dirty_x1, ((r.x1 - 1) | 15) + 1); dirty_y1 = std::max(dirty_y1, ((r.y1 - 1) | 7) + 1);
+    dirty_x0 = std::min(dirty_x0, (r.x0 / TW) * TW); dirty_y0 = std::min(dirty_y0, (r.y0 / TH) * TH);
+    dirty_x1 = std::max(dirty_x1, ((r.x1 - 1) / TW + 1) * TW); dirty_y1 = std::max(dirty_y1, ((r.y1 - 1) / TH + 1) * TH);
+}
+// is the RGBA8 read copy stale anywhere in r (8 = the upload cause bit)
+static int rgba_test(Rgn r) {
+    if (!dirty_any) return 0;
+    if (r.x1 - r.x0 >= 1024) { r.x0 = 0; r.x1 = 1024; }
+    if (r.y1 - r.y0 >= 512) { r.y0 = 0; r.y1 = 512; }
+    if (r.x1 <= r.x0 || r.y1 <= r.y0) return 0;
+    for (int ty = r.y0 / TH; ty <= (r.y1 - 1) / TH; ty++)
+        for (int tx = r.x0 / TW; tx <= (r.x1 - 1) / TW; tx++)
+            if (rgba_stale[ty % TY][tx % TX]) return 8;
+    return 0;
 }
 // marks a possibly wrapping area
 static void dirty_mark_wrap(int x, int y, int w, int h, int cause) {
@@ -443,9 +470,8 @@ static int dirty_test(Rgn r) {
     if (r.y1 - r.y0 >= 512) { r.y0 = 0; r.y1 = 512; }
     if (r.x1 <= r.x0 || r.y1 <= r.y0) return 0;
     int c = 0;
-    for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
-        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++)
-            if (dirty_bits[ty & 63] & (1ull << (tx & 63))) c |= dirty_cause[ty & 63][tx & 63];
+    for (int ty = r.y0 / TH; ty <= (r.y1 - 1) / TH; ty++)
+        for (int tx = r.x0 / TW; tx <= (r.x1 - 1) / TW; tx++) c |= dirty_cause[ty % TY][tx % TX];
     return c;
 }
 // statistics: why read copies were refreshed, and the first few cases in detail
@@ -463,6 +489,17 @@ static void note_sync(int cause, const Rgn& r, const char* what) {
 }
 
 static uint64_t g_read_syncs = 0;
+// Render-to-texture budget: every refresh of the read copies makes a tile-based GPU finish and
+// restart the frame (~0.5 ms on the TV's Mali-G52), and CTR's missile effects read back what
+// they just drew up to ~60 times per frame. With a budget (Android default), only the first
+// reads per frame get a refreshed copy; later ones read the copy as it is, missing what was
+// drawn in between. 0 (default) = always exact: a budget of 4 visibly breaks CTR's missile
+// explosion, which builds up its glow by reading back its own output.
+int g_gl_sync_budget = 0;
+static int g_frame_syncs = 0;
+int g_gl_effect_snapshot = 1;  // see add_prim; --gl-exact sets 0
+static uint64_t g_effect_reuse = 0;
+static uint64_t g_syncs_skipped = 0;
 static void flush();
 static void bind_vertices(const void* data, size_t bytes);
 
@@ -499,8 +536,8 @@ static void sync_read() {
     glBlitFramebuffer(x0, ty0, x1, ty1, x0, ty0, x1, ty1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     pack_native(dirty_x0, dirty_y0, dirty_x1, dirty_y1);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
-    memset(dirty_bits, 0, sizeof dirty_bits);
     memset(dirty_cause, 0, sizeof dirty_cause);
+    memset(rgba_stale, 0, sizeof rgba_stale);
     dirty_any = false;
     dirty_x0 = 1024; dirty_y0 = 512; dirty_x1 = 0; dirty_y1 = 0;
 }
@@ -520,17 +557,17 @@ static void sync_area(Rgn r) {
     r.x0 = std::max(r.x0, 0); r.y0 = std::max(r.y0, 0);
     r.x1 = std::min(r.x1, 1024); r.y1 = std::min(r.y1, 512);
     if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
-    int tx0 = 64, ty0 = 64, tx1 = -1, ty1 = -1;
-    for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
-        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++)
-            if (dirty_bits[ty] & (1ull << tx)) {
+    int tx0 = TX, ty0 = TY, tx1 = -1, ty1 = -1;
+    for (int ty = r.y0 / TH; ty <= (r.y1 - 1) / TH; ty++)
+        for (int tx = r.x0 / TW; tx <= (r.x1 - 1) / TW; tx++)
+            if (dirty_cause[ty][tx] || rgba_stale[ty][tx]) {
                 tx0 = std::min(tx0, tx); tx1 = std::max(tx1, tx);
                 ty0 = std::min(ty0, ty); ty1 = std::max(ty1, ty);
             }
     if (tx1 < 0) return;
     flush();
     g_read_syncs++;
-    int nx0 = tx0 * 16, nx1 = (tx1 + 1) * 16, ny0 = ty0 * 8, ny1 = (ty1 + 1) * 8;  // native
+    int nx0 = tx0 * TW, nx1 = (tx1 + 1) * TW, ny0 = ty0 * TH, ny1 = (ty1 + 1) * TH;  // native
     int x0 = nx0 << gsh, x1 = nx1 << gsh, fy0 = VH - (ny1 << gsh), fy1 = VH - (ny0 << gsh);  // texture rows
     glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_draw);
@@ -538,18 +575,9 @@ static void sync_area(Rgn r) {
     glBlitFramebuffer(x0, fy0, x1, fy1, x0, fy0, x1, fy1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     pack_native(nx0, ny0, nx1, ny1);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
-    uint64_t row = (tx1 >= 63 ? ~0ull : ((1ull << (tx1 + 1)) - 1)) & ~((1ull << tx0) - 1);
-    bool any = false;
-    for (int ty = 0; ty < 64; ty++) {
-        if (ty >= ty0 && ty <= ty1) {
-            dirty_bits[ty] &= ~row;
-            for (int tx = tx0; tx <= tx1; tx++) dirty_cause[ty][tx] = 0;
-        }
-        any |= dirty_bits[ty] != 0;
-    }
-    if (!any) {
-        dirty_any = false;
-        dirty_x0 = 1024; dirty_y0 = 512; dirty_x1 = 0; dirty_y1 = 0;
+    for (int ty = ty0; ty <= ty1; ty++) {
+        memset(&dirty_cause[ty][tx0], 0, (size_t)(tx1 - tx0 + 1));
+        memset(&rgba_stale[ty][tx0], 0, (size_t)(tx1 - tx0 + 1));
     }
 }
 
@@ -720,9 +748,26 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     box = Rgn{std::max(box.x0, x0), std::max(box.y0, y0), std::min(box.x1, x1), std::min(box.y1, y1)};
     if (box.x1 <= box.x0 || box.y1 <= box.y0) return;
     if (d.mask_check && !g_fetch && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
+    // A primitive that samples the area it draws over is a screen-space effect (CTR's heat
+    // shimmer around missiles and explosions: dozens of small triangles, each re-reading the
+    // picture under itself). The first one in an area gets a refreshed copy, with everything
+    // drawn before it; later ones do not refresh just for each other's output (they distort
+    // the scene as it was before the effect, ~60 frame restarts less on a tile-based GPU; the
+    // PS1's texture cache isn't kept coherent with drawing either). --gl-exact: always refresh.
+    bool effect = g_gl_effect_snapshot && d.textured && nreads > 0 && reads[0].x0 < box.x1 && box.x0 < reads[0].x1 &&
+                  reads[0].y0 < box.y1 && box.y0 < reads[0].y1;
     // a texture read of something drawn since the last refresh of the read copy
     for (int i = 0; i < nreads; i++)
         if (int c = dirty_test(reads[i])) {
+            if (effect && (c & ~16) == 0) {
+                g_effect_reuse++;  // stale only from the effect's own primitives
+                continue;
+            }
+            if (g_gl_sync_budget > 0 && g_frame_syncs >= g_gl_sync_budget) {
+                g_syncs_skipped++;  // over the budget: read the copy as it is (see g_gl_sync_budget)
+                continue;
+            }
+            g_frame_syncs++;
             note_sync(c, reads[i], i == 0 ? "texture" : "CLUT");
             sync_area(reads[i]);
         }
@@ -744,7 +789,7 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     }
     if (kind == B_SEMI_TEX) batch_boxes.push_back(box);
     batch.insert(batch.end(), v, v + n);
-    dirty_mark(box, 0);
+    dirty_mark(box, effect ? 4 : 0);  // (cause bit 4: drawn by a screen-space effect)
     g_prims++;
 }
 
@@ -765,9 +810,10 @@ static void draw_tri(const Job& j) {
     uint32_t m = mode_bits(d, false), tw = tw_bits(d);
     GV t[3];
     for (int i = 0; i < 3; i++) t[i] = gv(v[i].x * k + 0.5f, v[i].y * k + 0.5f, v[i].r, v[i].g, v[i].b, (float)v[i].u, (float)v[i].v, m, tw);
-    // native bounding box (sub-pixel vertices can lie up to 2 pixels from the integer ones)
-    Rgn box{std::min({v[0].nx, v[1].nx, v[2].nx}) - 2, std::min({v[0].ny, v[1].ny, v[2].ny}) - 2,
-            std::max({v[0].nx, v[1].nx, v[2].nx}) + 2, std::max({v[0].ny, v[1].ny, v[2].ny}) + 2};
+    // native pixels the triangle can touch, from its sub-pixel vertices: [floor(min), ceil(max))
+    Rgn box{std::min({v[0].x, v[1].x, v[2].x}) >> SUB, std::min({v[0].y, v[1].y, v[2].y}) >> SUB,
+            (std::max({v[0].x, v[1].x, v[2].x}) + (1 << SUB) - 1) >> SUB,
+            (std::max({v[0].y, v[1].y, v[2].y}) + (1 << SUB) - 1) >> SUB};
     Rgn rd[2];
     int nr = tex_reads(d, std::min({v[0].u, v[1].u, v[2].u}), std::max({v[0].u, v[1].u, v[2].u}),
                        std::min({v[0].v, v[1].v, v[2].v}), std::max({v[0].v, v[1].v, v[2].v}), rd);
@@ -877,8 +923,9 @@ static void vram_copy(const Job& j) {
     int sx = j.v[0].nx, sy = j.v[0].ny, dx = j.v[1].nx, dy = j.v[1].ny, w = j.v[2].nx, h = j.v[2].ny;
     if (j.d.mask_check && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
     // the source must be current in the read copy
-    if (int c = dirty_test(Rgn{sx, sy, sx + w, sy + h}) | dirty_test(Rgn{0, 0, sx + w - 1024, sy + h}) |
-                dirty_test(Rgn{sx, 0, sx + w, sy + h - 512}) | dirty_test(Rgn{0, 0, sx + w - 1024, sy + h - 512})) {
+    auto stale = [](Rgn r) { return dirty_test(r) | rgba_test(r); };  // copies read the RGBA8 copy
+    if (int c = stale(Rgn{sx, sy, sx + w, sy + h}) | stale(Rgn{0, 0, sx + w - 1024, sy + h}) |
+                stale(Rgn{sx, 0, sx + w, sy + h - 512}) | stale(Rgn{0, 0, sx + w - 1024, sy + h - 512})) {
         note_sync(c, Rgn{sx, sy, sx + w, sy + h}, "VRAM copy");
         sync_area(Rgn{sx, sy, sx + w, sy + h});
         sync_area(Rgn{0, 0, sx + w - 1024, sy + h});
@@ -934,7 +981,22 @@ static void upload(const Job& j) {
             copy_quad(px0 << gsh, py0 << gsh, (px0 + pw) << gsh, (py0 + ph) << gsh);
         });
     });
-    dirty_mark_wrap(x, y, w, h, 3);  // upload
+    // and straight into the native copy (no refresh needed before primitives read it)
+    glBindTexture(GL_TEXTURE_2D, tex_nat);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+    static std::vector<uint16_t> piece;
+    split_wrap(x, w, 1024, [&](int ox, int px0, int pw) {
+        split_wrap(y, h, 512, [&](int oy, int py0, int ph) {
+            piece.resize((size_t)pw * ph);
+            for (int yy = 0; yy < ph; yy++)
+                for (int xx = 0; xx < pw; xx++) {
+                    uint16_t v = src[(size_t)(oy + yy) * w + ox + xx];
+                    piece[(size_t)yy * pw + xx] = j.d.mask_set ? (uint16_t)(v | 0x8000) : v;
+                }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, px0, py0, pw, ph, GL_RED_INTEGER, GL_UNSIGNED_SHORT, piece.data());
+            upload_mark(Rgn{px0, py0, px0 + pw, py0 + ph});
+        });
+    });
     delete j.data;
 }
 
@@ -1019,6 +1081,10 @@ static void screenshot(const PresentInfo& p) {
 
 static void present(const PresentInfo& p) {
     flush();
+    // the frame ends here anyway (the screen is drawn next): bring the read copies fully up to
+    // date, so the next frame starts with nothing stale and only its own render-to-texture
+    // reads refresh them
+    sync_read();
     if (p.shot) screenshot(p);
     if (!p.swap) return;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1101,6 +1167,7 @@ static void present(const PresentInfo& p) {
     }
     prev = f;
     g_gl_presents_done.fetch_add(1, std::memory_order_release);
+    g_frame_syncs = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
 }
 
@@ -1233,11 +1300,13 @@ void gl_stats_line(char* out, size_t size, int frames) {
     double f = frames;
     snprintf(out, size,
              "GL thread busy %.2f ms/frame (present %.2f), %.0f jobs, %.0f prims, %.0f batches (new: kind %.0f, area %.0f, "
-             "overlap %.0f), %.1f read copies (stale from drawing %.1f, fill %.1f, copy %.1f, upload %.1f)",
+             "overlap %.0f), %.1f read copies (stale from drawing %.1f, fill %.1f, copy %.1f, upload %.1f), %.1f over budget, %.1f effect reuses",
              g_busy_ns / 1e6 / f, g_present_ns / 1e6 / f, g_jobs / f, g_prims / f, g_batches / f, g_break_why[0] / f,
              g_break_why[1] / f, g_break_why[2] / f, g_read_syncs / f, g_sync_cause[0] / f, g_sync_cause[1] / f,
-             g_sync_cause[2] / f, g_sync_cause[3] / f);
+             g_sync_cause[2] / f, g_sync_cause[3] / f, g_syncs_skipped / f, g_effect_reuse / f);
+    g_effect_reuse = 0;
     memset(g_sync_cause, 0, sizeof g_sync_cause);
+    g_syncs_skipped = 0;
     g_busy_ns = g_present_ns = g_jobs = g_prims = g_batches = g_read_syncs = 0;
     memset(g_break_why, 0, sizeof g_break_why);
 }

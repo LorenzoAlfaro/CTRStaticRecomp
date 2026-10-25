@@ -28,6 +28,8 @@ void bios_flush_cards();
 extern SDL_Window* g_gl_window;
 extern SDL_GLContext g_gl_context;
 extern int g_gl_debug;
+extern int g_gl_sync_budget;
+extern int g_gl_effect_snapshot;
 
 static SDL_Window* window = nullptr;
 static SDL_Renderer* renderer = nullptr;
@@ -781,6 +783,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--display") && i + 1 < argc) win_display = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--players") && i + 1 < argc) players_opt = std::clamp(atoi(argv[++i]), 1, 2);
         else if (!strcmp(argv[i], "--gl-debug") && i + 1 < argc) g_gl_debug = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gl-sync-budget") && i + 1 < argc) g_gl_sync_budget = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gl-exact")) g_gl_effect_snapshot = 0;
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
             shot_frame = strtoull(argv[++i], nullptr, 10);
