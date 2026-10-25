@@ -63,9 +63,12 @@ static GLuint vao = 0, vbo = 0;
 static GLuint prog_draw = 0, prog_copy = 0, prog_present = 0;
 static struct { GLint size, vram, shift, pass, flip; } ud;
 static struct { GLint size, src, dst0, src0, div, mask, flip, src_h, src_flip; } uc;
-static struct { GLint vram, shift, origin, rgb24, flip, disp, cheap; } up;
-int g_gl_debug = 0;  // --gl-debug bits (experiments): 1 no mask pass, 2 cheap present, 4 draw nothing,
-                     // 8 no dual-source blending, 16 no framebuffer fetch
+static struct { GLint vram, shift, origin, rgb24, flip, disp; } up;
+static GLuint prog_blit = 0, tex_disp = 0, fbo_disp = 0;  // the converted frame (see kPresentVS)
+static int disp_tw = 0, disp_th = 0;
+static GLint ub_tex;
+int g_gl_debug = 0;  // --gl-debug bits (experiments): 1 no mask pass, 4 draw nothing,
+                     // 8 no dual-source blending, 16 no framebuffer fetch, 32 save the window with screenshots
 
 // ---- shaders ----------------------------------------------------------------------------------
 static const char* kHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
@@ -255,7 +258,10 @@ void main() {
 }
 )";
 
-// shows the display area: 15-bit with bilinear filtering of the decoded colours, or 24-bit
+// Showing a frame takes two passes: the display area is converted once per frame, one fragment
+// per pixel at the internal resolution (15-bit) or the native one (24-bit), into an RGBA8
+// texture; the GPU's bilinear filtering then scales that to the screen. (Decoding and filtering
+// four VRAM samples per screen pixel cost the TV's GPU ~6 ms per frame at 2x.)
 static const char* kPresentVS = R"(
 layout(location = 0) in vec2 a_pos;  // NDC
 layout(location = 2) in vec2 a_uv;   // display coordinates (native pixels, y down)
@@ -268,7 +274,6 @@ uniform int u_shift;
 uniform ivec2 u_origin;  // display origin (native)
 uniform ivec2 u_disp;    // display size (native)
 uniform int u_rgb24;
-uniform int u_cheap;  // experiment: nearest sampling, one fetch
 uniform int u_flip;
 in vec2 v_uv;
 layout(location = 0) out vec4 o;
@@ -297,14 +302,21 @@ void main() {
         o = vec4(vec3(r, g, b) / 255.0, 1.0);
         return;
     }
-    if (u_cheap != 0) { o = vec4(px15(ivec2(v_uv * float(1 << u_shift))), 1.0); return; }
-    vec2 f = v_uv * float(1 << u_shift) - 0.5;
-    ivec2 i0 = ivec2(floor(f));
-    vec2 t = f - floor(f);
-    vec3 a = mix(px15(i0), px15(i0 + ivec2(1, 0)), t.x);
-    vec3 b = mix(px15(i0 + ivec2(0, 1)), px15(i0 + ivec2(1, 1)), t.x);
-    o = vec4(mix(a, b, t.y), 1.0);
+    o = vec4(px15(ivec2(v_uv * float(1 << u_shift))), 1.0);  // one internal pixel per fragment
 }
+)";
+// scales the converted frame to the screen
+static const char* kBlitVS = R"(
+layout(location = 0) in vec2 a_pos;  // NDC
+layout(location = 2) in vec2 a_uv;   // 0..1
+out vec2 v_uv;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }
+)";
+static const char* kBlitFS = R"(
+uniform sampler2D u_tex;
+in vec2 v_uv;
+layout(location = 0) out vec4 o;
+void main() { o = texture(u_tex, v_uv); }
 )";
 
 static GLuint compile(GLenum type, const char* src, const char* header = kHeader) {
@@ -941,11 +953,20 @@ static void present(const PresentInfo& p) {
         logged_w = p.win_w; logged_h = p.win_h;
         LOGI("GL: output %dx%d, picture %dx%d", p.win_w, p.win_h, p.dst_w, p.dst_h);
     }
-    glViewport(0, 0, p.win_w, p.win_h);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
     if (p.disp.enabled) {
-        glViewport(p.dst_x, p.win_h - p.dst_y - p.dst_h, p.dst_w, p.dst_h);
+        // 1. convert the display area (texture row ch-1 = display row 0)
+        int cw = p.disp.rgb24 ? p.disp.w : p.disp.w << gsh, ch = p.disp.rgb24 ? p.disp.h : p.disp.h << gsh;
+        if (cw != disp_tw || ch != disp_th) {
+            if (tex_disp) { glDeleteFramebuffers(1, &fbo_disp); glDeleteTextures(1, &tex_disp); }
+            tex_disp = make_tex(cw, ch);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            fbo_disp = make_fbo(tex_disp);
+            disp_tw = cw;
+            disp_th = ch;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_disp);
+        glViewport(0, 0, cw, ch);
         glUseProgram(prog_present);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex_draw);
@@ -955,12 +976,43 @@ static void present(const PresentInfo& p) {
         glUniform2i(up.disp, p.disp.w, p.disp.h);
         glUniform1i(up.rgb24, p.disp.rgb24 ? 1 : 0);
         glUniform1i(up.flip, VH - 1);
-        glUniform1i(up.cheap, (g_gl_debug & 2) ? 1 : 0);
         float w = (float)p.disp.w, h = (float)p.disp.h;
         GV v[6] = {gv(-1, 1, 0, 0, 0, 0, 0, 0, 0), gv(1, 1, 0, 0, 0, w, 0, 0, 0), gv(-1, -1, 0, 0, 0, 0, h, 0, 0),
                    gv(1, 1, 0, 0, 0, w, 0, 0, 0), gv(1, -1, 0, 0, 0, w, h, 0, 0), gv(-1, -1, 0, 0, 0, 0, h, 0, 0)};
         bind_vertices(v, sizeof v);
         glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    // 2. scale it to the picture rectangle on the screen
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, p.win_w, p.win_h);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (p.disp.enabled) {
+        glViewport(p.dst_x, p.win_h - p.dst_y - p.dst_h, p.dst_w, p.dst_h);
+        glUseProgram(prog_blit);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_disp);
+        glUniform1i(ub_tex, 0);
+        GV v[6] = {gv(-1, 1, 0, 0, 0, 0, 1, 0, 0), gv(1, 1, 0, 0, 0, 1, 1, 0, 0), gv(-1, -1, 0, 0, 0, 0, 0, 0, 0),
+                   gv(1, 1, 0, 0, 0, 1, 1, 0, 0), gv(1, -1, 0, 0, 0, 1, 0, 0, 0), gv(-1, -1, 0, 0, 0, 0, 0, 0, 0)};
+        bind_vertices(v, sizeof v);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    if ((g_gl_debug & 32) && p.shot) {
+        // debug (--gl-debug 32): save what goes to the window as gl_window_N.bmp
+        static int n = 0;
+        std::vector<uint8_t> px((size_t)p.win_w * p.win_h * 4), flip(px.size());
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, p.win_w, p.win_h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        for (int y = 0; y < p.win_h; y++)
+            memcpy(&flip[(size_t)y * p.win_w * 4], &px[(size_t)(p.win_h - 1 - y) * p.win_w * 4], (size_t)p.win_w * 4);
+        if (SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(flip.data(), p.win_w, p.win_h, 32, p.win_w * 4,
+                                                                SDL_PIXELFORMAT_ABGR8888)) {
+            char name[64];
+            snprintf(name, sizeof name, "gl_window_%d.bmp", n++);
+            SDL_SaveBMP(s, name);
+            SDL_FreeSurface(s);
+        }
     }
     SDL_GL_SwapWindow(g_gl_window);
     // at most one frame queued on the GPU: wait for the previous one to finish (otherwise a
@@ -1026,7 +1078,9 @@ bool gl_thread_init() {
     up.disp = glGetUniformLocation(prog_present, "u_disp");
     up.rgb24 = glGetUniformLocation(prog_present, "u_rgb24");
     up.flip = glGetUniformLocation(prog_present, "u_flip");
-    up.cheap = glGetUniformLocation(prog_present, "u_cheap");
+    prog_blit = link(kBlitVS, kBlitFS);
+    if (!prog_blit) return false;
+    ub_tex = glGetUniformLocation(prog_blit, "u_tex");
 
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
