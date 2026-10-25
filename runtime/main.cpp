@@ -57,7 +57,7 @@ static bool paused = false;
 static uint64_t exit_after_frames = 0;
 
 // --keys "frame:button[+button]:duration,..." scripted input for automated tests
-struct KeyEvent { uint64_t frame, until; uint16_t mask; };
+struct KeyEvent { uint64_t frame, until; uint16_t mask, mask2; };  // mask2: player 2 ("p2.cross")
 static std::vector<KeyEvent> key_script;
 static uint16_t button_bit(const std::string& n) {
     static const char* names[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
@@ -81,7 +81,9 @@ static void parse_keys(const std::string& spec) {
         size_t p2 = 0;
         while (p2 <= btns.size()) {
             size_t q = btns.find('+', p2);
-            e.mask |= button_bit(btns.substr(p2, q == std::string::npos ? std::string::npos : q - p2));
+            std::string name = btns.substr(p2, q == std::string::npos ? std::string::npos : q - p2);
+            if (name.rfind("p2.", 0) == 0) e.mask2 |= button_bit(name.substr(3));
+            else e.mask |= button_bit(name);
             if (q == std::string::npos) break;
             p2 = q + 1;
         }
@@ -222,10 +224,48 @@ static void controller_hotkeys() {
     prev_r = r;
 }
 
+// Players: the first real gamepad (left stick and face buttons) is player 1, the second is
+// player 2. The keyboard, generic joysticks (e.g. vJoy) and devices that are not real gamepads
+// (a TV's remote, which Android reports as a controller) always count as player 1. Port 2 has a
+// pad plugged in only while player 2 has one, so with one controller the game sees exactly what
+// it did before. --players 1|2 overrides; scripted runs (--keys) default to 1 player.
+static int players_opt = 0;
+static bool is_player_pad(SDL_GameController* g) {
+    return SDL_GameControllerHasAxis(g, SDL_CONTROLLER_AXIS_LEFTX) && SDL_GameControllerHasAxis(g, SDL_CONTROLLER_AXIS_LEFTY) &&
+           SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_A) && SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_X) &&
+           SDL_GameControllerHasButton(g, SDL_CONTROLLER_BUTTON_Y);
+}
+
+// PS1 buttons pressed on a gamepad (active low bits cleared in b)
+static void gamepad_buttons(SDL_GameController* gamepad, uint16_t& b) {
+    auto press = [&](int bit) { b &= ~(1u << bit); };
+    auto btn = [&](SDL_GameControllerButton sb, int bit) { if (SDL_GameControllerGetButton(gamepad, sb)) press(bit); };
+    btn(SDL_CONTROLLER_BUTTON_BACK, 0);
+    btn(SDL_CONTROLLER_BUTTON_START, 3);
+    btn(SDL_CONTROLLER_BUTTON_DPAD_UP, 4);
+    btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 5);
+    btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN, 6);
+    btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT, 7);
+    btn(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 10);
+    btn(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 11);
+    btn(SDL_CONTROLLER_BUTTON_Y, 12);
+    btn(SDL_CONTROLLER_BUTTON_B, 13);
+    btn(SDL_CONTROLLER_BUTTON_A, 14);
+    btn(SDL_CONTROLLER_BUTTON_X, 15);
+    if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000) press(8);
+    if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000) press(9);
+    int lx = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTX);
+    int ly = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTY);
+    if (lx < -12000) press(7);
+    if (lx > 12000) press(5);
+    if (ly < -12000) press(4);
+    if (ly > 12000) press(6);
+}
+
 static void update_pad() {
     controller_hotkeys();
     const uint8_t* k = SDL_GetKeyboardState(nullptr);
-    uint16_t b = 0xFFFF;
+    uint16_t b = 0xFFFF, b2 = 0xFFFF;
     auto press = [&](int bit) { b &= ~(1u << bit); };
     // keyboard (same layout as the CTR-PC port)
     if (k[SDL_SCANCODE_SPACE]) press(0);
@@ -244,29 +284,23 @@ static void update_pad() {
     if (k[SDL_SCANCODE_X]) press(15);
     if (k[SDL_SCANCODE_LEFTBRACKET]) press(1);
     if (k[SDL_SCANCODE_RIGHTBRACKET]) press(2);
+    int max_players = players_opt ? players_opt : (key_script.empty() ? 2 : 1);
+    SDL_GameController* p2_pad = nullptr;
+    int player_pads = 0;
     for (SDL_GameController* gamepad : gamepads) {
-        auto btn = [&](SDL_GameControllerButton sb, int bit) { if (SDL_GameControllerGetButton(gamepad, sb)) press(bit); };
-        btn(SDL_CONTROLLER_BUTTON_BACK, 0);
-        btn(SDL_CONTROLLER_BUTTON_START, 3);
-        btn(SDL_CONTROLLER_BUTTON_DPAD_UP, 4);
-        btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 5);
-        btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN, 6);
-        btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT, 7);
-        btn(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 10);
-        btn(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 11);
-        btn(SDL_CONTROLLER_BUTTON_Y, 12);
-        btn(SDL_CONTROLLER_BUTTON_B, 13);
-        btn(SDL_CONTROLLER_BUTTON_A, 14);
-        btn(SDL_CONTROLLER_BUTTON_X, 15);
-        if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000) press(8);
-        if (SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 12000) press(9);
-        int lx = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTX);
-        int ly = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTY);
-        if (lx < -12000) press(7);
-        if (lx > 12000) press(5);
-        if (ly < -12000) press(4);
-        if (ly > 12000) press(6);
+        if (is_player_pad(gamepad) && player_pads++ == 1 && max_players >= 2) {
+            p2_pad = gamepad;
+            gamepad_buttons(gamepad, b2);
+        } else {
+            gamepad_buttons(gamepad, b);  // player 1 (or a third pad, which joins player 1)
+        }
     }
+    bool p2 = p2_pad != nullptr || players_opt == 2;
+    if (p2 != g_pads[1].connected) {
+        if (p2) LOGI("player 2: %s", p2_pad ? SDL_GameControllerName(p2_pad) : "(no controller, --players 2)");
+        else LOGI("player 2 controller disconnected");
+    }
+    g_pads[1].connected = p2;
     for (SDL_Joystick* joystick : joysticks) {
         // generic layout: 0 X/Cross, 1 Circle, 2 Square, 3 Triangle, 4 L1, 5 R1, 6 L2, 7 R2, 8 Select, 9 Start
         static const int map[10] = {14, 13, 15, 12, 10, 11, 8, 9, 0, 3};
@@ -288,7 +322,8 @@ static void update_pad() {
         }
     }
     for (const KeyEvent& e : key_script)
-        if (frame_counter >= e.frame && frame_counter < e.until) b &= ~e.mask;
+        if (frame_counter >= e.frame && frame_counter < e.until) { b &= ~e.mask; b2 &= ~e.mask2; }
+    g_pads[1].buttons = g_pads[1].connected ? b2 : 0xFFFF;
     if (b != g_pads[0].buttons) LOGD("pad: %04x", (uint16_t)~b);
     g_pads[0].buttons = b;
 }
@@ -679,6 +714,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-dither")) gpu_set_dither(false);
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) want_gl = !strcmp(argv[++i], "gl");
         else if (!strcmp(argv[i], "--display") && i + 1 < argc) win_display = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--players") && i + 1 < argc) players_opt = std::clamp(atoi(argv[++i]), 1, 2);
         else if (!strcmp(argv[i], "--gl-debug") && i + 1 < argc) g_gl_debug = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) exit_after_frames = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc) {
