@@ -203,8 +203,16 @@ static void cycle_aspect() {
     save_settings();
 }
 
+// F10 / right-stick click cycles 1x -> 2x -> 4x; on Android only 1x <-> 2x (4x can't keep full
+// speed on phones and TVs; --scale still sets any scale)
+#ifdef __ANDROID__
+constexpr int kMaxCycleScale = 2;
+#else
+constexpr int kMaxCycleScale = 4;
+#endif
+
 static void cycle_scale() {
-    gpu_set_scale(gpu_scale() >= 4 ? 1 : gpu_scale() * 2);
+    gpu_set_scale(gpu_scale() >= kMaxCycleScale ? 1 : gpu_scale() * 2);
     LOGI("internal resolution: %dx", gpu_scale());
     save_settings();
 }
@@ -680,6 +688,9 @@ int main(int argc, char** argv) {
 #endif
     g_pgxp = true;
     load_settings();
+#ifdef __ANDROID__
+    if (gpu_scale() > kMaxCycleScale) gpu_set_scale(kMaxCycleScale);  // e.g. a 4x saved by an older build
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) g_log_level = LOG_DEBUG;
         else if (!strcmp(argv[i], "--profile")) profile = true;
