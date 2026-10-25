@@ -583,7 +583,7 @@ void frontend_vblank() {
                  (unsigned long long)g_gpu_stall_why[2], (unsigned long long)g_gpu_stall_why[3]);
             memset(g_gpu_stall_why, 0, sizeof g_gpu_stall_why);
             LOGI("profile: spu %.2f ms/frame (%s)", g_spu_ns.exchange(0) / 1e6 / 300, g_spu_thread ? "audio thread" : "inline");
-            if (gl_on) { char gls[320]; gl_stats_line(gls, sizeof gls, 300); LOGI("profile: %s", gls); }
+            if (gl_on) { char gls[512]; gl_stats_line(gls, sizeof gls, 300); LOGI("profile: %s", gls); }
             LOGI("profile: compiled regions declined %llu instructions (%llu stop address)", (unsigned long long)g_flat_misses, (unsigned long long)g_flat_stop_misses);
             extern uint64_t g_spu_drains, g_gl_readbacks;
             extern int64_t g_spu_drain_ns;

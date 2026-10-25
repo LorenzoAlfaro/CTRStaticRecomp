@@ -414,33 +414,52 @@ static void set_scale(int shift) {
 // ---- dirty tracking (areas drawn since the read copy was refreshed) -------------------------
 // 16x8 native-pixel tiles, as in gpu.cpp's hazard tracking
 static uint64_t dirty_bits[64];
+static uint8_t dirty_cause[64][64];  // what made each tile stale: bit 0 drawing, 1 fill, 2 copy, 3 upload
 static bool dirty_any = false;
 static int dirty_x0 = 1024, dirty_y0 = 512, dirty_x1 = 0, dirty_y1 = 0;
 
-static void dirty_mark(Rgn r) {
+static void dirty_mark(Rgn r, int cause) {
     r.x0 = std::max(r.x0, 0); r.y0 = std::max(r.y0, 0);
     r.x1 = std::min(r.x1, 1024); r.y1 = std::min(r.y1, 512);
     if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
     for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
-        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++) dirty_bits[ty] |= 1ull << tx;
+        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++) {
+            dirty_bits[ty] |= 1ull << tx;
+            dirty_cause[ty][tx] |= (uint8_t)(1 << cause);
+        }
     dirty_any = true;
     dirty_x0 = std::min(dirty_x0, r.x0 & ~15); dirty_y0 = std::min(dirty_y0, r.y0 & ~7);
     dirty_x1 = std::max(dirty_x1, ((r.x1 - 1) | 15) + 1); dirty_y1 = std::max(dirty_y1, ((r.y1 - 1) | 7) + 1);
 }
 // marks a possibly wrapping area
-static void dirty_mark_wrap(int x, int y, int w, int h) {
+static void dirty_mark_wrap(int x, int y, int w, int h, int cause) {
     for (int oy = 0; oy < 2; oy++)
-        for (int ox = 0; ox < 2; ox++) dirty_mark(Rgn{x - ox * 1024, y - oy * 512, x + w - ox * 1024, y + h - oy * 512});
+        for (int ox = 0; ox < 2; ox++) dirty_mark(Rgn{x - ox * 1024, y - oy * 512, x + w - ox * 1024, y + h - oy * 512}, cause);
 }
-static bool dirty_test(Rgn r) {
-    if (!dirty_any) return false;
+// what made the area stale (dirty_cause bits), 0 if it is current
+static int dirty_test(Rgn r) {
+    if (!dirty_any) return 0;
     if (r.x1 - r.x0 >= 1024) { r.x0 = 0; r.x1 = 1024; }
     if (r.y1 - r.y0 >= 512) { r.y0 = 0; r.y1 = 512; }
-    if (r.x1 <= r.x0 || r.y1 <= r.y0) return false;
+    if (r.x1 <= r.x0 || r.y1 <= r.y0) return 0;
+    int c = 0;
     for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
         for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++)
-            if (dirty_bits[ty & 63] & (1ull << (tx & 63))) return true;
-    return false;
+            if (dirty_bits[ty & 63] & (1ull << (tx & 63))) c |= dirty_cause[ty & 63][tx & 63];
+    return c;
+}
+// statistics: why read copies were refreshed, and the first few cases in detail
+static uint64_t g_sync_cause[4];
+static void note_sync(int cause, const Rgn& r, const char* what) {
+    for (int i = 0; i < 4; i++) if (cause & (1 << i)) g_sync_cause[i]++;
+    static int logged[3];
+    int k = what[0] == 't' ? 0 : what[0] == 'C' ? 1 : 2;  // texture, CLUT, VRAM copy
+    if (logged[k] < 16) {
+        logged[k]++;
+        LOGI("GL: read copy for %s %d,%d-%d,%d (stale from%s%s%s%s), drawn area %d,%d-%d,%d", what, r.x0, r.y0, r.x1, r.y1,
+             cause & 1 ? " drawing" : "", cause & 2 ? " fill" : "", cause & 4 ? " copy" : "", cause & 8 ? " upload" : "",
+             dirty_x0, dirty_y0, dirty_x1, dirty_y1);
+    }
 }
 
 static uint64_t g_read_syncs = 0;
@@ -481,8 +500,57 @@ static void sync_read() {
     pack_native(dirty_x0, dirty_y0, dirty_x1, dirty_y1);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
     memset(dirty_bits, 0, sizeof dirty_bits);
+    memset(dirty_cause, 0, sizeof dirty_cause);
     dirty_any = false;
     dirty_x0 = 1024; dirty_y0 = 512; dirty_x1 = 0; dirty_y1 = 0;
+}
+
+// Bring the read copies up to date for the stale tiles in r only (a texture read of something
+// drawn this frame, e.g. CTR's missile effects reading thin strips of the frame being drawn):
+// copies the bounding box of those tiles instead of everything drawn since the last refresh;
+// other stale areas stay marked.
+static void sync_area(Rgn r) {
+    if (!dirty_any) return;
+    if (r.x1 - r.x0 >= 1024) { r.x0 = 0; r.x1 = 1024; }
+    if (r.y1 - r.y0 >= 512) { r.y0 = 0; r.y1 = 512; }
+    // the parts past the right / bottom edge wrap around VRAM
+    if (r.x1 > 1024) sync_area(Rgn{0, r.y0, r.x1 - 1024, r.y1});
+    if (r.y1 > 512) sync_area(Rgn{r.x0, 0, r.x1, r.y1 - 512});
+    if (r.x1 > 1024 && r.y1 > 512) sync_area(Rgn{0, 0, r.x1 - 1024, r.y1 - 512});
+    r.x0 = std::max(r.x0, 0); r.y0 = std::max(r.y0, 0);
+    r.x1 = std::min(r.x1, 1024); r.y1 = std::min(r.y1, 512);
+    if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
+    int tx0 = 64, ty0 = 64, tx1 = -1, ty1 = -1;
+    for (int ty = r.y0 >> 3; ty <= (r.y1 - 1) >> 3; ty++)
+        for (int tx = r.x0 >> 4; tx <= (r.x1 - 1) >> 4; tx++)
+            if (dirty_bits[ty] & (1ull << tx)) {
+                tx0 = std::min(tx0, tx); tx1 = std::max(tx1, tx);
+                ty0 = std::min(ty0, ty); ty1 = std::max(ty1, ty);
+            }
+    if (tx1 < 0) return;
+    flush();
+    g_read_syncs++;
+    int nx0 = tx0 * 16, nx1 = (tx1 + 1) * 16, ny0 = ty0 * 8, ny1 = (ty1 + 1) * 8;  // native
+    int x0 = nx0 << gsh, x1 = nx1 << gsh, fy0 = VH - (ny1 << gsh), fy1 = VH - (ny0 << gsh);  // texture rows
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_draw);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_read);
+    glBlitFramebuffer(x0, fy0, x1, fy1, x0, fy0, x1, fy1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    pack_native(nx0, ny0, nx1, ny1);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
+    uint64_t row = (tx1 >= 63 ? ~0ull : ((1ull << (tx1 + 1)) - 1)) & ~((1ull << tx0) - 1);
+    bool any = false;
+    for (int ty = 0; ty < 64; ty++) {
+        if (ty >= ty0 && ty <= ty1) {
+            dirty_bits[ty] &= ~row;
+            for (int tx = tx0; tx <= tx1; tx++) dirty_cause[ty][tx] = 0;
+        }
+        any |= dirty_bits[ty] != 0;
+    }
+    if (!any) {
+        dirty_any = false;
+        dirty_x0 = 1024; dirty_y0 = 512; dirty_x1 = 0; dirty_y1 = 0;
+    }
 }
 
 // ---- primitive batches ------------------------------------------------------------------------
@@ -654,7 +722,10 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     if (d.mask_check && !g_fetch && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
     // a texture read of something drawn since the last refresh of the read copy
     for (int i = 0; i < nreads; i++)
-        if (dirty_test(reads[i])) { sync_read(); break; }
+        if (int c = dirty_test(reads[i])) {
+            note_sync(c, reads[i], i == 0 ? "texture" : "CLUT");
+            sync_area(reads[i]);
+        }
     BatchKind kind = g_fetch || !(d.semi && d.semi_mode == 2) ? B_MAIN : d.textured ? B_SEMI_TEX : B_SEMI;
     bool same_kind = batch_kind == kind && (kind == B_OPAQUE || kind == B_MAIN || batch_semi_mode == d.semi_mode);
     bool same_sc = sc_x0 == x0 << gsh && sc_y0 == y0 << gsh && sc_x1 == x1 << gsh && sc_y1 == y1 << gsh;
@@ -673,7 +744,7 @@ static void add_prim(const DrawCtx& d, const GV* v, int n, Rgn box, const Rgn* r
     }
     if (kind == B_SEMI_TEX) batch_boxes.push_back(box);
     batch.insert(batch.end(), v, v + n);
-    dirty_mark(box);
+    dirty_mark(box, 0);
     g_prims++;
 }
 
@@ -771,7 +842,7 @@ static void fill(const Job& j) {
         });
     });
     glDisable(GL_SCISSOR_TEST);
-    dirty_mark_wrap(x, y, w, h);
+    dirty_mark_wrap(x, y, w, h, 1);  // fill
 }
 
 // draw a destination rectangle (internal pixels) with the copy program
@@ -806,9 +877,14 @@ static void vram_copy(const Job& j) {
     int sx = j.v[0].nx, sy = j.v[0].ny, dx = j.v[1].nx, dy = j.v[1].ny, w = j.v[2].nx, h = j.v[2].ny;
     if (j.d.mask_check && !g_mask_check++) LOGW("GL: mask-checked drawing is not supported yet (ignored)");
     // the source must be current in the read copy
-    if (dirty_test(Rgn{sx, sy, sx + w, sy + h}) || dirty_test(Rgn{0, 0, sx + w - 1024, sy + h}) ||
-        dirty_test(Rgn{sx, 0, sx + w, sy + h - 512}) || dirty_test(Rgn{0, 0, sx + w - 1024, sy + h - 512}))
-        sync_read();
+    if (int c = dirty_test(Rgn{sx, sy, sx + w, sy + h}) | dirty_test(Rgn{0, 0, sx + w - 1024, sy + h}) |
+                dirty_test(Rgn{sx, 0, sx + w, sy + h - 512}) | dirty_test(Rgn{0, 0, sx + w - 1024, sy + h - 512})) {
+        note_sync(c, Rgn{sx, sy, sx + w, sy + h}, "VRAM copy");
+        sync_area(Rgn{sx, sy, sx + w, sy + h});
+        sync_area(Rgn{0, 0, sx + w - 1024, sy + h});
+        sync_area(Rgn{sx, 0, sx + w, sy + h - 512});
+        sync_area(Rgn{0, 0, sx + w - 1024, sy + h - 512});
+    }
     begin_copy(tex_read, 0, j.d.mask_set, true, VH);
     // pieces where neither the source nor the destination wraps
     int xs[4] = {0, w, 0, 0}, nx = 2, ys[4] = {0, h, 0, 0}, ny = 2;
@@ -829,7 +905,7 @@ static void vram_copy(const Job& j) {
             glUniform2i(uc.src0, ((sx + ox) & 1023) << gsh, ((sy + oy) & 511) << gsh);
             copy_quad(px0 << gsh, py0 << gsh, (px0 + pw) << gsh, (py0 + ph) << gsh);
         }
-    dirty_mark_wrap(dx, dy, w, h);
+    dirty_mark_wrap(dx, dy, w, h, 2);  // copy
 }
 
 static std::vector<uint8_t> stage_buf;
@@ -858,7 +934,7 @@ static void upload(const Job& j) {
             copy_quad(px0 << gsh, py0 << gsh, (px0 + pw) << gsh, (py0 + ph) << gsh);
         });
     });
-    dirty_mark_wrap(x, y, w, h);
+    dirty_mark_wrap(x, y, w, h, 3);  // upload
     delete j.data;
 }
 
@@ -1157,9 +1233,11 @@ void gl_stats_line(char* out, size_t size, int frames) {
     double f = frames;
     snprintf(out, size,
              "GL thread busy %.2f ms/frame (present %.2f), %.0f jobs, %.0f prims, %.0f batches (new: kind %.0f, area %.0f, "
-             "overlap %.0f), %.1f read copies",
+             "overlap %.0f), %.1f read copies (stale from drawing %.1f, fill %.1f, copy %.1f, upload %.1f)",
              g_busy_ns / 1e6 / f, g_present_ns / 1e6 / f, g_jobs / f, g_prims / f, g_batches / f, g_break_why[0] / f,
-             g_break_why[1] / f, g_break_why[2] / f, g_read_syncs / f);
+             g_break_why[1] / f, g_break_why[2] / f, g_read_syncs / f, g_sync_cause[0] / f, g_sync_cause[1] / f,
+             g_sync_cause[2] / f, g_sync_cause[3] / f);
+    memset(g_sync_cause, 0, sizeof g_sync_cause);
     g_busy_ns = g_present_ns = g_jobs = g_prims = g_batches = g_read_syncs = 0;
     memset(g_break_why, 0, sizeof g_break_why);
 }
